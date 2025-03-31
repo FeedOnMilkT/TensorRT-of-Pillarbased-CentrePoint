@@ -1,0 +1,9 @@
+onnx/
+engines/
+results/
+*.plan
+*.sif
+build/
+__pycache__/
+*.pyc
+deps/
