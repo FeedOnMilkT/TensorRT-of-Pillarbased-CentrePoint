@@ -18,14 +18,13 @@ include_directories(
 link_directories(${TRT_LIB_DIR})
 link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 
-# 引擎构建工具（Phase 3 实现后启用）
-# add_executable(build_engine
-#     src/engine_builder.cpp
-#     src/main.cpp
-# )
-# target_link_libraries(build_engine
-#     nvinfer nvonnxparser nvinfer_plugin cudart
-# )
+add_executable(build_engine
+    src/engine_builder.cpp
+    src/main.cpp
+)
+target_link_libraries(build_engine
+    nvinfer nvonnxparser nvinfer_plugin cudart
+)
 
 # 推理 pipeline（Phase 4 实现后启用）
 # add_executable(infer_pipeline

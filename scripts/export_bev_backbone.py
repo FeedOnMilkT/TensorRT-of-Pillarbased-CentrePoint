@@ -80,7 +80,9 @@ def main():
 
     # 构造 output 名称：6 个 task × 6 个预测项
     num_tasks = len(model.dense_head.heads_list)
+
     output_names = []
+    
     for t in range(num_tasks):
         for name in ['hm', 'center', 'center_z', 'dim', 'rot', 'vel']:
             output_names.append(f'task{t}_{name}')
