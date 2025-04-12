@@ -26,7 +26,15 @@ target_link_libraries(build_engine
     nvinfer nvonnxparser nvinfer_plugin cudart
 )
 
-# 推理 pipeline（Phase 4 实现后启用）
+add_executable(test_infer
+    src/infer_context.cpp
+    src/test_infer.cpp
+)
+target_link_libraries(test_infer
+    nvinfer nvinfer_plugin cudart
+)
+
+# 推理 pipeline（scatter kernel 实现后启用）
 # add_executable(infer_pipeline
 #     pipeline/infer_pipeline.cpp
 #     src/infer_context.cpp
