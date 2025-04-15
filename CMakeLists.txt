@@ -34,7 +34,13 @@ target_link_libraries(test_infer
     nvinfer nvinfer_plugin cudart
 )
 
-# 推理 pipeline（scatter kernel 实现后启用）
+add_executable(test_scatter
+    cuda/scatter_kernel.cu
+    src/test_scatter.cpp
+)
+target_link_libraries(test_scatter cudart)
+
+# 推理 pipeline（端到端联调时启用）
 # add_executable(infer_pipeline
 #     pipeline/infer_pipeline.cpp
 #     src/infer_context.cpp
