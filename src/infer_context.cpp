@@ -132,7 +132,12 @@ void InferContext::getOutput(const std::string& name,
 
 // ── getOutputShape ────────────────────────────────────────────────────────────
 
-std::vector<int> InferContext::getOutputShape(const std::string& name) 
+std::vector<int> InferContext::getOutputShape(const std::string& name)
 {
     return fromDims(context_->getTensorShape(name.c_str()));
+}
+
+void* InferContext::getDeviceBuffer(const std::string& name) const
+{
+    return buffers_.at(name);
 }

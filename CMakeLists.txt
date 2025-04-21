@@ -40,12 +40,13 @@ add_executable(test_scatter
 )
 target_link_libraries(test_scatter cudart)
 
-# 推理 pipeline（端到端联调时启用）
-# add_executable(infer_pipeline
-#     pipeline/infer_pipeline.cpp
-#     src/infer_context.cpp
-#     cuda/scatter_kernel.cu
-# )
-# target_link_libraries(infer_pipeline
-#     nvinfer nvinfer_plugin cudart
-# )
+add_executable(infer_pipeline
+    pipeline/infer_pipeline.cpp
+    src/infer_context.cpp
+    src/pillarize.cpp
+    src/postprocess.cpp
+    cuda/scatter_kernel.cu
+)
+target_link_libraries(infer_pipeline
+    nvinfer nvinfer_plugin cudart
+)

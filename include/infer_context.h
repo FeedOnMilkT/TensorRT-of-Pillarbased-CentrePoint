@@ -27,6 +27,9 @@ public:
     // 查询 output 的实际 shape（动态输入时推断后才准确）
     std::vector<int> getOutputShape(const std::string& name);
 
+    // 返回 tensor 的 GPU 指针，供外部 kernel 零拷贝读写
+    void* getDeviceBuffer(const std::string& name) const;
+
 private:
     class Logger : public nvinfer1::ILogger 
     {
