@@ -2,6 +2,7 @@
 #include "scatter_kernel.h"
 #include "pillarize.h"
 #include "postprocess.h"
+#include "bench.h"
 #include <cuda_runtime.h>
 #include <fstream>
 #include <iostream>
@@ -63,10 +64,14 @@ static void writeFrameJson(std::ostream& os,
 }
 
 int main(int argc, char** argv) {
-    // 解析参数：位置参数为 .bin 文件，--file-list <path> 从文本文件读取输入列表
     std::string json_path;
     std::string file_list_path;
     std::vector<std::string> bin_files;
+
+    bool benchmark = false;
+    int  warmup_iters = 10;
+    int  bench_iters = 200;
+    std::string bench_output;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -74,6 +79,14 @@ int main(int argc, char** argv) {
             json_path = argv[++i];
         } else if (arg == "--file-list" && i + 1 < argc) {
             file_list_path = argv[++i];
+        } else if (arg == "--benchmark") {
+            benchmark = true;
+        } else if (arg == "--warmup" && i + 1 < argc) {
+            warmup_iters = std::stoi(argv[++i]);
+        } else if (arg == "--bench-iters" && i + 1 < argc) {
+            bench_iters = std::stoi(argv[++i]);
+        } else if (arg == "--bench-output" && i + 1 < argc) {
+            bench_output = argv[++i];
         } else {
             bin_files.push_back(arg);
         }
@@ -89,11 +102,12 @@ int main(int argc, char** argv) {
     }
 
     if (bin_files.empty()) {
-        std::cerr << "Usage: infer_pipeline <file.bin> [file2.bin ...] [--file-list files.txt] [--json out.json]\n";
+        std::cerr << "Usage: infer_pipeline <file.bin> [...] [--file-list files.txt]\n"
+                  << "                       [--json out.json]\n"
+                  << "                       [--benchmark [--warmup N] [--bench-iters N] [--bench-output bench.json]]\n";
         return 1;
     }
 
-    // 引擎加载一次，所有帧复用
     InferContext pfn_ctx("/workspace/engines/pfn_fp16.plan");
     InferContext bb_ctx("/workspace/engines/backbone_head_fp16.plan");
 
@@ -103,31 +117,24 @@ int main(int argc, char** argv) {
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
-    std::ofstream jf;
-    if (!json_path.empty()) {
-        jf.open(json_path);
-        jf << "{\n";
-    }
+    // 单帧 pipeline：可选传入 timer 做分阶段计时；返回当帧检测框
+    auto runOneFrame = [&](const float* pts_ptr, int N, StageTimer* timer)
+                       -> std::vector<Detection> {
+        if (timer) timer->beginFrameGpu(stream);
 
-    int total = (int)bin_files.size();
-    for (int fi = 0; fi < total; fi++) {
-        const auto& bin_path = bin_files[fi];
-
-        // 1. 加载点云
-        int N;
-        auto pts = loadBin(bin_path, N);
-
-        // 2. Pillarize
-        auto batch = pillarize(pts.data(), N,
+        if (timer) timer->begin("pillarize");
+        auto batch = pillarize(pts_ptr, N,
             X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX,
             VX, VY, VZ, MAX_PTS, MAX_PILLARS);
         int P = batch.P;
+        if (timer) timer->end("pillarize");
 
-        // 3. coords → GPU
+        if (timer) timer->begin("h2d_coords");
         cudaMemcpy(d_coords, batch.coords.data(), P * 4 * sizeof(int),
                    cudaMemcpyHostToDevice);
+        if (timer) timer->end("h2d_coords");
 
-        // 4. PFN
+        if (timer) timer->begin("pfn");
         pfn_ctx.setInputShape("pillar_features", {P, MAX_PTS, C_IN});
         pfn_ctx.setInputShape("pillar_mask",     {P, MAX_PTS});
         pfn_ctx.setInput("pillar_features",
@@ -135,19 +142,22 @@ int main(int argc, char** argv) {
         pfn_ctx.setInput("pillar_mask",
                          batch.mask.data(),     P * MAX_PTS * sizeof(float));
         pfn_ctx.infer();
+        if (timer) timer->end("pfn");
 
-        // 5. Scatter → backbone input buffer（零拷贝）
+        if (timer) timer->begin("scatter");
         float* d_canvas = static_cast<float*>(bb_ctx.getDeviceBuffer("spatial_features"));
         cudaMemset(d_canvas, 0, C_OUT * BEV_H * BEV_W * sizeof(float));
         const float* d_emb = static_cast<const float*>(
             pfn_ctx.getDeviceBuffer("pillar_embeddings"));
         launchPillarScatter(d_emb, d_coords, d_canvas, P, C_OUT, BEV_H, BEV_W, stream);
         cudaStreamSynchronize(stream);
+        if (timer) timer->end("scatter");
 
-        // 6. Backbone + Head
+        if (timer) timer->begin("backbone");
         bb_ctx.infer();
+        if (timer) timer->end("backbone");
 
-        // 7. Decode + NMS
+        if (timer) timer->begin("decode_nms");
         std::vector<Detection> all_dets;
         int cls_offset = 0;
         for (int t = 0; t < 6; t++) {
@@ -177,33 +187,85 @@ int main(int argc, char** argv) {
             all_dets.insert(all_dets.end(), dets.begin(), dets.end());
             cls_offset += nc;
         }
+        if (timer) timer->end("decode_nms");
 
-        // 8. 输出
+        if (timer) timer->endFrameGpu(stream);
+        return all_dets;
+    };
+
+    if (benchmark) {
+        std::cerr << "[benchmark] preloading " << bin_files.size()
+                  << " bin files into memory (excluded from timing)...\n";
+        std::vector<std::vector<float>> preloaded;
+        std::vector<int> preloaded_N;
+        preloaded.reserve(bin_files.size());
+        preloaded_N.reserve(bin_files.size());
+        for (const auto& p : bin_files) {
+            int N;
+            preloaded.push_back(loadBin(p, N));
+            preloaded_N.push_back(N);
+        }
+        std::cerr << "[benchmark] warmup=" << warmup_iters
+                  << "  iters=" << bench_iters << "\n";
+
+        StageTimer timer;
+        for (int i = 0; i < warmup_iters; i++) {
+            int idx = i % (int)preloaded.size();
+            (void)runOneFrame(preloaded[idx].data(), preloaded_N[idx], nullptr);
+        }
+        cudaDeviceSynchronize();
+
+        for (int i = 0; i < bench_iters; i++) {
+            int idx = i % (int)preloaded.size();
+            (void)runOneFrame(preloaded[idx].data(), preloaded_N[idx], &timer);
+            timer.commitFrame();
+        }
+
+        timer.summary(std::cout);
+        if (!bench_output.empty()) {
+            timer.writeJson(bench_output);
+            std::cerr << "[benchmark] wrote " << bench_output << "\n";
+        }
+    } else {
+        std::ofstream jf;
         if (!json_path.empty()) {
-            writeFrameJson(jf, bin_path, all_dets);
-            if (fi + 1 < total) jf << ",";
-            jf << "\n";
-        } else {
-            std::cout << "\n[" << (fi+1) << "/" << total << "] " << bin_path
-                      << "  points=" << N << "  pillars=" << P
-                      << "  dets=" << all_dets.size() << "\n";
-            for (auto& d : all_dets) {
-                printf("  %-25s score=%.3f  xyz=(%.1f,%.1f,%.1f)  wlh=(%.1f,%.1f,%.1f)  rot=%.2f\n",
-                       CLASS_NAMES[d.cls_id], d.score,
-                       d.x, d.y, d.z, d.w, d.l, d.h, d.rot);
+            jf.open(json_path);
+            jf << "{\n";
+        }
+
+        int total = (int)bin_files.size();
+        for (int fi = 0; fi < total; fi++) {
+            const auto& bin_path = bin_files[fi];
+
+            int N;
+            auto pts = loadBin(bin_path, N);
+
+            auto all_dets = runOneFrame(pts.data(), N, nullptr);
+
+            if (!json_path.empty()) {
+                writeFrameJson(jf, bin_path, all_dets);
+                if (fi + 1 < total) jf << ",";
+                jf << "\n";
+            } else {
+                std::cout << "\n[" << (fi+1) << "/" << total << "] " << bin_path
+                          << "  points=" << N << "  dets=" << all_dets.size() << "\n";
+                for (auto& d : all_dets) {
+                    printf("  %-25s score=%.3f  xyz=(%.1f,%.1f,%.1f)  wlh=(%.1f,%.1f,%.1f)  rot=%.2f\n",
+                           CLASS_NAMES[d.cls_id], d.score,
+                           d.x, d.y, d.z, d.w, d.l, d.h, d.rot);
+                }
+            }
+
+            if (!(json_path.empty() || total == 1)
+                && ((fi+1) % 20 == 0 || fi+1 == total)) {
+                std::cerr << "  [" << (fi+1) << "/" << total << "] done\n";
             }
         }
 
-        if (json_path.empty() || total == 1) {
-            // 单帧模式才打进度
-        } else if ((fi+1) % 20 == 0 || fi+1 == total) {
-            std::cerr << "  [" << (fi+1) << "/" << total << "] done\n";
+        if (!json_path.empty()) {
+            jf << "}\n";
+            std::cerr << "JSON written to " << json_path << "\n";
         }
-    }
-
-    if (!json_path.empty()) {
-        jf << "}\n";
-        std::cerr << "JSON written to " << json_path << "\n";
     }
 
     cudaFree(d_coords);
