@@ -1,6 +1,7 @@
 #include "infer_context.h"
 #include "scatter_kernel.h"
 #include "pillarize.h"
+#include "pillarize_cuda.h"
 #include "postprocess.h"
 #include "bench.h"
 #include <cuda_runtime.h>
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
     int  warmup_iters = 10;
     int  bench_iters = 200;
     std::string bench_output;
+    bool cuda_pillarize = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -87,6 +89,8 @@ int main(int argc, char** argv) {
             bench_iters = std::stoi(argv[++i]);
         } else if (arg == "--bench-output" && i + 1 < argc) {
             bench_output = argv[++i];
+        } else if (arg == "--cuda-pillarize") {
+            cuda_pillarize = true;
         } else {
             bin_files.push_back(arg);
         }
@@ -117,32 +121,98 @@ int main(int argc, char** argv) {
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
+    // CUDA pillarize 路径需要的 workspace + 点云 device buffer + host pinned int 拿 P
+    float*        d_points = nullptr;
+    int           d_points_capacity = 0;
+    unsigned int* d_voxel_point_count = nullptr;
+    float*        d_voxels_dense = nullptr;
+    float*        d_voxel_features_compact = nullptr;
+    unsigned int* d_voxel_num_points = nullptr;
+    unsigned int* d_pillar_num = nullptr;
+    unsigned int* h_pillar_num = nullptr;   // pinned host
+    if (cuda_pillarize) {
+        PillarizeWorkspaceBytes wb;
+        pillarizeCudaWorkspaceBytes(BEV_H, BEV_W, MAX_PTS, MAX_PILLARS, wb);
+        cudaMalloc(&d_voxel_point_count,      wb.voxel_point_count_bytes);
+        cudaMalloc(&d_voxels_dense,           wb.voxels_dense_bytes);
+        cudaMalloc(&d_voxel_features_compact, wb.voxel_features_bytes);
+        cudaMalloc(&d_voxel_num_points,       wb.voxel_num_points_bytes);
+        cudaMalloc(&d_pillar_num,             wb.pillar_num_bytes);
+        cudaHostAlloc(&h_pillar_num, sizeof(unsigned int), cudaHostAllocDefault);
+        std::cerr << "[pipeline] pillarize=CUDA  workspace="
+                  << (wb.voxel_point_count_bytes + wb.voxels_dense_bytes + wb.voxel_features_bytes
+                      + wb.voxel_num_points_bytes + wb.pillar_num_bytes) / (1024*1024)
+                  << " MB\n";
+    } else {
+        std::cerr << "[pipeline] pillarize=CPU\n";
+    }
+
     // 单帧 pipeline：可选传入 timer 做分阶段计时；返回当帧检测框
     auto runOneFrame = [&](const float* pts_ptr, int N, StageTimer* timer)
                        -> std::vector<Detection> {
         if (timer) timer->beginFrameGpu(stream);
 
-        if (timer) timer->begin("pillarize");
-        auto batch = pillarize(pts_ptr, N,
-            X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX,
-            VX, VY, VZ, MAX_PTS, MAX_PILLARS);
-        int P = batch.P;
-        if (timer) timer->end("pillarize");
+        int P = 0;
+        if (cuda_pillarize) {
+            // 点云 H2D（按需扩容）
+            if (timer) timer->begin("h2d_points");
+            if (N > d_points_capacity) {
+                if (d_points) cudaFree(d_points);
+                d_points_capacity = N + (N >> 2);  // 多分一点避免下次扩容
+                cudaMalloc(&d_points, d_points_capacity * 5 * sizeof(float));
+            }
+            cudaMemcpyAsync(d_points, pts_ptr, N * 5 * sizeof(float),
+                            cudaMemcpyHostToDevice, stream);
+            if (timer) timer->end("h2d_points");
 
-        if (timer) timer->begin("h2d_coords");
-        cudaMemcpy(d_coords, batch.coords.data(), P * 4 * sizeof(int),
-                   cudaMemcpyHostToDevice);
-        if (timer) timer->end("h2d_coords");
+            // pillarize 直接写到 PFN 的 input device buffer，零中间拷贝
+            if (timer) timer->begin("pillarize");
+            float* d_pfn_features = static_cast<float*>(
+                pfn_ctx.getDeviceBuffer("pillar_features"));
+            float* d_pfn_mask = static_cast<float*>(
+                pfn_ctx.getDeviceBuffer("pillar_mask"));
+            launchPillarizeCuda(
+                d_points, N,
+                X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX,
+                VX, VY, VZ, BEV_H, BEV_W, MAX_PTS, MAX_PILLARS,
+                d_voxel_point_count, d_voxels_dense, d_voxel_features_compact,
+                d_voxel_num_points, d_pillar_num,
+                d_pfn_features, d_pfn_mask, d_coords,
+                h_pillar_num, stream);
+            cudaStreamSynchronize(stream);  // 等 h_pillar_num 可读
+            P = static_cast<int>(*h_pillar_num);
+            if (P > MAX_PILLARS) P = MAX_PILLARS;
+            if (timer) timer->end("pillarize");
 
-        if (timer) timer->begin("pfn");
-        pfn_ctx.setInputShape("pillar_features", {P, MAX_PTS, C_IN});
-        pfn_ctx.setInputShape("pillar_mask",     {P, MAX_PTS});
-        pfn_ctx.setInput("pillar_features",
-                         batch.features.data(), P * MAX_PTS * C_IN * sizeof(float));
-        pfn_ctx.setInput("pillar_mask",
-                         batch.mask.data(),     P * MAX_PTS * sizeof(float));
-        pfn_ctx.infer();
-        if (timer) timer->end("pfn");
+            if (timer) timer->begin("pfn");
+            pfn_ctx.setInputShape("pillar_features", {P, MAX_PTS, C_IN});
+            pfn_ctx.setInputShape("pillar_mask",     {P, MAX_PTS});
+            // device buffer 已被 launchPillarizeCuda 填好，跳过 setInput 的 H2D
+            pfn_ctx.infer();
+            if (timer) timer->end("pfn");
+        } else {
+            if (timer) timer->begin("pillarize");
+            auto batch = pillarize(pts_ptr, N,
+                X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX,
+                VX, VY, VZ, MAX_PTS, MAX_PILLARS);
+            P = batch.P;
+            if (timer) timer->end("pillarize");
+
+            if (timer) timer->begin("h2d_coords");
+            cudaMemcpy(d_coords, batch.coords.data(), P * 4 * sizeof(int),
+                       cudaMemcpyHostToDevice);
+            if (timer) timer->end("h2d_coords");
+
+            if (timer) timer->begin("pfn");
+            pfn_ctx.setInputShape("pillar_features", {P, MAX_PTS, C_IN});
+            pfn_ctx.setInputShape("pillar_mask",     {P, MAX_PTS});
+            pfn_ctx.setInput("pillar_features",
+                             batch.features.data(), P * MAX_PTS * C_IN * sizeof(float));
+            pfn_ctx.setInput("pillar_mask",
+                             batch.mask.data(),     P * MAX_PTS * sizeof(float));
+            pfn_ctx.infer();
+            if (timer) timer->end("pfn");
+        }
 
         if (timer) timer->begin("scatter");
         float* d_canvas = static_cast<float*>(bb_ctx.getDeviceBuffer("spatial_features"));
@@ -269,6 +339,15 @@ int main(int argc, char** argv) {
     }
 
     cudaFree(d_coords);
+    if (cuda_pillarize) {
+        if (d_points) cudaFree(d_points);
+        cudaFree(d_voxel_point_count);
+        cudaFree(d_voxels_dense);
+        cudaFree(d_voxel_features_compact);
+        cudaFree(d_voxel_num_points);
+        cudaFree(d_pillar_num);
+        cudaFreeHost(h_pillar_num);
+    }
     cudaStreamDestroy(stream);
     return 0;
 }
