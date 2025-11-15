@@ -47,6 +47,13 @@ add_executable(test_pillarize
 )
 target_link_libraries(test_pillarize cudart)
 
+add_executable(test_postprocess
+    cuda/postprocess_kernel.cu
+    src/postprocess.cpp
+    src/test_postprocess.cpp
+)
+target_link_libraries(test_postprocess cudart)
+
 # Plugin 静态库：由 build_engine / infer_pipeline_4b / 单测共享链接
 add_library(centerpoint_plugin STATIC
     plugin/scatter_plugin.cpp
@@ -69,6 +76,7 @@ add_executable(infer_pipeline
     src/bench.cpp
     cuda/scatter_kernel.cu
     cuda/pillarize_kernel.cu
+    cuda/postprocess_kernel.cu
 )
 target_link_libraries(infer_pipeline
     nvinfer nvinfer_plugin cudart
@@ -82,6 +90,7 @@ add_executable(infer_pipeline_4b
     src/postprocess.cpp
     src/bench.cpp
     cuda/pillarize_kernel.cu
+    cuda/postprocess_kernel.cu
 )
 target_link_libraries(infer_pipeline_4b
     centerpoint_plugin nvinfer nvinfer_plugin cudart
