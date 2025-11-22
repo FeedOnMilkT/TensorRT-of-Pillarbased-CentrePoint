@@ -3,6 +3,7 @@
 #include "pillarize.h"
 #include "pillarize_cuda.h"
 #include "postprocess.h"
+#include "postprocess_cuda.h"
 #include "bench.h"
 #include <cuda_runtime.h>
 #include <fstream>
@@ -26,6 +27,7 @@ static constexpr float SCORE_THRESH = 0.1f;
 
 static const int   TASK_NUM_CLS[6]    = {1, 2, 2, 1, 2, 2};
 static const float TASK_NMS_RADIUS[6] = {2.0f, 4.0f, 6.0f, 0.5f, 1.5f, 0.5f};
+static constexpr int MAX_CANDS_PER_TASK = 4096;  // peak filter 后通常 < 几百，此 buffer 远超
 
 static const char* CLASS_NAMES[10] = {
     "car", "truck", "construction_vehicle", "bus", "trailer",
@@ -74,6 +76,7 @@ int main(int argc, char** argv) {
     int  bench_iters = 200;
     std::string bench_output;
     bool cuda_pillarize = false;
+    bool cuda_postprocess = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -91,6 +94,8 @@ int main(int argc, char** argv) {
             bench_output = argv[++i];
         } else if (arg == "--cuda-pillarize") {
             cuda_pillarize = true;
+        } else if (arg == "--cuda-postprocess") {
+            cuda_postprocess = true;
         } else {
             bin_files.push_back(arg);
         }
@@ -145,6 +150,25 @@ int main(int argc, char** argv) {
                   << " MB\n";
     } else {
         std::cerr << "[pipeline] pillarize=CPU\n";
+    }
+
+    // GPU 后处理 workspace：候选 buffer + 计数器 + host pinned mirror
+    Detection*    d_cand_buffer         = nullptr;
+    unsigned int* d_cand_count          = nullptr;
+    Detection*    h_cand_buffer_pinned  = nullptr;
+    unsigned int* h_cand_count_pinned   = nullptr;
+    if (cuda_postprocess) {
+        PostprocessWorkspaceBytes pwb;
+        postprocessCudaWorkspaceBytes(6, MAX_CANDS_PER_TASK, pwb);
+        cudaMalloc(&d_cand_buffer,                              pwb.cand_buffer_bytes);
+        cudaMalloc(&d_cand_count,                               pwb.cand_count_bytes);
+        cudaHostAlloc(&h_cand_buffer_pinned, pwb.cand_buffer_bytes, cudaHostAllocDefault);
+        cudaHostAlloc(&h_cand_count_pinned,  pwb.cand_count_bytes,  cudaHostAllocDefault);
+        std::cerr << "[pipeline] postprocess=CUDA  workspace="
+                  << (pwb.cand_buffer_bytes + pwb.cand_count_bytes) / 1024
+                  << " KB\n";
+    } else {
+        std::cerr << "[pipeline] postprocess=CPU\n";
     }
 
     // 单帧 pipeline：可选传入 timer 做分阶段计时；返回当帧检测框
@@ -229,33 +253,96 @@ int main(int argc, char** argv) {
 
         if (timer) timer->begin("decode_nms");
         std::vector<Detection> all_dets;
-        int cls_offset = 0;
-        for (int t = 0; t < 6; t++) {
-            std::string pre = "task" + std::to_string(t) + "_";
-            int nc = TASK_NUM_CLS[t];
 
-            auto hm_shape = bb_ctx.getOutputShape(pre + "hm");
-            int H = hm_shape[2], W = hm_shape[3];
-            size_t map = (size_t)(H * W) * sizeof(float);
+        if (cuda_postprocess) {
+            // GPU 路径：直接读 backbone engine 的 device output buffer，
+            // 避免 6 task × 6 tensor × 16K float 的 D2H（~1.5 MB → 几百 Detection）
+            cudaMemsetAsync(d_cand_count, 0,
+                            sizeof(unsigned int) * 6, stream);
 
-            std::vector<float> hm(nc*H*W), center(2*H*W), center_z(H*W);
-            std::vector<float> dim(3*H*W), rot(2*H*W), vel(2*H*W);
+            int cls_offset_gpu = 0;
+            for (int t = 0; t < 6; t++) {
+                std::string pre = "task" + std::to_string(t) + "_";
+                int nc = TASK_NUM_CLS[t];
+                auto hm_shape = bb_ctx.getOutputShape(pre + "hm");
+                int H = hm_shape[2], W = hm_shape[3];
 
-            bb_ctx.getOutput(pre+"hm",       hm.data(),       nc*map);
-            bb_ctx.getOutput(pre+"center",   center.data(),    2*map);
-            bb_ctx.getOutput(pre+"center_z", center_z.data(),  map);
-            bb_ctx.getOutput(pre+"dim",      dim.data(),       3*map);
-            bb_ctx.getOutput(pre+"rot",      rot.data(),       2*map);
-            bb_ctx.getOutput(pre+"vel",      vel.data(),       2*map);
+                const float* d_hm = static_cast<const float*>(
+                    bb_ctx.getDeviceBuffer(pre + "hm"));
+                const float* d_center = static_cast<const float*>(
+                    bb_ctx.getDeviceBuffer(pre + "center"));
+                const float* d_center_z = static_cast<const float*>(
+                    bb_ctx.getDeviceBuffer(pre + "center_z"));
+                const float* d_dim = static_cast<const float*>(
+                    bb_ctx.getDeviceBuffer(pre + "dim"));
+                const float* d_rot = static_cast<const float*>(
+                    bb_ctx.getDeviceBuffer(pre + "rot"));
+                const float* d_vel = static_cast<const float*>(
+                    bb_ctx.getDeviceBuffer(pre + "vel"));
 
-            auto dets = decodeTask(
-                hm.data(), center.data(), center_z.data(),
-                dim.data(), rot.data(), vel.data(),
-                H, W, nc, t, cls_offset,
-                SCORE_THRESH, X_MIN, Y_MIN, VX, VY, OUT_STRIDE);
-            dets = circleNMS(dets, TASK_NMS_RADIUS[t]);
-            all_dets.insert(all_dets.end(), dets.begin(), dets.end());
-            cls_offset += nc;
+                launchDecodeTaskCuda(
+                    d_hm, d_center, d_center_z, d_dim, d_rot, d_vel,
+                    H, W, nc, t, cls_offset_gpu, MAX_CANDS_PER_TASK,
+                    SCORE_THRESH, X_MIN, Y_MIN, VX, VY, OUT_STRIDE,
+                    d_cand_buffer + (size_t)t * MAX_CANDS_PER_TASK,
+                    d_cand_count + t,
+                    stream);
+                cls_offset_gpu += nc;
+            }
+
+            // 一次性 D2H：count + buffer，到 host pinned
+            cudaMemcpyAsync(h_cand_count_pinned, d_cand_count,
+                            sizeof(unsigned int) * 6,
+                            cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(h_cand_buffer_pinned, d_cand_buffer,
+                            sizeof(Detection) * 6 * MAX_CANDS_PER_TASK,
+                            cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+
+            // host 上每 task sort + circle NMS（K 通常 < 几百，CPU 微秒级）
+            for (int t = 0; t < 6; t++) {
+                unsigned int K = h_cand_count_pinned[t];
+                if (K > (unsigned int)MAX_CANDS_PER_TASK) {
+                    std::cerr << "[warn] task " << t << " candidate overflow: "
+                              << K << " > " << MAX_CANDS_PER_TASK
+                              << "（候选被截断；考虑调大 MAX_CANDS_PER_TASK）\n";
+                    K = MAX_CANDS_PER_TASK;
+                }
+                std::vector<Detection> dets(
+                    h_cand_buffer_pinned + (size_t)t * MAX_CANDS_PER_TASK,
+                    h_cand_buffer_pinned + (size_t)t * MAX_CANDS_PER_TASK + K);
+                dets = circleNMS(dets, TASK_NMS_RADIUS[t]);
+                all_dets.insert(all_dets.end(), dets.begin(), dets.end());
+            }
+        } else {
+            int cls_offset = 0;
+            for (int t = 0; t < 6; t++) {
+                std::string pre = "task" + std::to_string(t) + "_";
+                int nc = TASK_NUM_CLS[t];
+
+                auto hm_shape = bb_ctx.getOutputShape(pre + "hm");
+                int H = hm_shape[2], W = hm_shape[3];
+                size_t map = (size_t)(H * W) * sizeof(float);
+
+                std::vector<float> hm(nc*H*W), center(2*H*W), center_z(H*W);
+                std::vector<float> dim(3*H*W), rot(2*H*W), vel(2*H*W);
+
+                bb_ctx.getOutput(pre+"hm",       hm.data(),       nc*map);
+                bb_ctx.getOutput(pre+"center",   center.data(),    2*map);
+                bb_ctx.getOutput(pre+"center_z", center_z.data(),  map);
+                bb_ctx.getOutput(pre+"dim",      dim.data(),       3*map);
+                bb_ctx.getOutput(pre+"rot",      rot.data(),       2*map);
+                bb_ctx.getOutput(pre+"vel",      vel.data(),       2*map);
+
+                auto dets = decodeTask(
+                    hm.data(), center.data(), center_z.data(),
+                    dim.data(), rot.data(), vel.data(),
+                    H, W, nc, t, cls_offset,
+                    SCORE_THRESH, X_MIN, Y_MIN, VX, VY, OUT_STRIDE);
+                dets = circleNMS(dets, TASK_NMS_RADIUS[t]);
+                all_dets.insert(all_dets.end(), dets.begin(), dets.end());
+                cls_offset += nc;
+            }
         }
         if (timer) timer->end("decode_nms");
 
@@ -347,6 +434,12 @@ int main(int argc, char** argv) {
         cudaFree(d_voxel_num_points);
         cudaFree(d_pillar_num);
         cudaFreeHost(h_pillar_num);
+    }
+    if (cuda_postprocess) {
+        cudaFree(d_cand_buffer);
+        cudaFree(d_cand_count);
+        cudaFreeHost(h_cand_buffer_pinned);
+        cudaFreeHost(h_cand_count_pinned);
     }
     cudaStreamDestroy(stream);
     return 0;
