@@ -21,6 +21,7 @@ link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 add_executable(build_engine
     src/engine_builder.cpp
     src/main.cpp
+    src/calibrator.cpp
 )
 target_link_libraries(build_engine
     centerpoint_plugin nvinfer nvonnxparser nvinfer_plugin cudart

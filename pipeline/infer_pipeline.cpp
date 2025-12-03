@@ -12,6 +12,8 @@
 #include <vector>
 #include <string>
 #include <iomanip>
+#include <cstring>
+#include <cstdio>
 
 static constexpr float X_MIN = -51.2f, X_MAX = 51.2f;
 static constexpr float Y_MIN = -51.2f, Y_MAX = 51.2f;
@@ -43,6 +45,33 @@ static std::vector<float> loadBin(const std::string& path, int& N) {
     std::vector<float> pts(N * 5);
     f.read(reinterpret_cast<char*>(pts.data()), bytes);
     return pts;
+}
+
+// 直接读到一个预分配的 pinned host buffer 里。容量不够时按需 cudaMallocHost 扩容。
+// 用于 --pinned-points 路径，省掉 std::vector 中转和 cudaMemcpyAsync 内部的 bounce 拷贝。
+static int loadBinIntoPinned(const std::string& path,
+                             float*& pinned, size_t& pinned_capacity_bytes) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("无法打开: " + path);
+    size_t bytes = f.tellg();
+    f.seekg(0);
+    if (bytes > pinned_capacity_bytes) {
+        if (pinned) cudaFreeHost(pinned);
+        pinned_capacity_bytes = bytes + (bytes >> 2);  // 25% slack 减少抖动期重分配
+        cudaHostAlloc(&pinned, pinned_capacity_bytes, cudaHostAllocDefault);
+    }
+    f.read(reinterpret_cast<char*>(pinned), bytes);
+    return (int)(bytes / (5 * sizeof(float)));
+}
+
+// INT8 校准张量 dump：所有帧统一 pad/截断到 OPT 形状（OPT_P = 12000），
+// pad 区 mask=0、features=0，不影响 PFN 行为；这样校准期 TRT 直接按 OPT 形状走。
+static constexpr int OPT_P = 12000;
+
+static void writeCalibBin(const std::string& path, const void* data, size_t bytes) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("无法写入: " + path);
+    f.write(reinterpret_cast<const char*>(data), bytes);
 }
 
 // 把一帧的 detections 追加到 JSON 流（调用方管理逗号分隔）
@@ -77,6 +106,9 @@ int main(int argc, char** argv) {
     std::string bench_output;
     bool cuda_pillarize = false;
     bool cuda_postprocess = false;
+    bool pinned_points = false;
+    std::string dump_calib_dir;
+    int dump_calib_frames = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -96,6 +128,12 @@ int main(int argc, char** argv) {
             cuda_pillarize = true;
         } else if (arg == "--cuda-postprocess") {
             cuda_postprocess = true;
+        } else if (arg == "--pinned-points") {
+            pinned_points = true;
+        } else if (arg == "--dump-calib-dir" && i + 1 < argc) {
+            dump_calib_dir = argv[++i];
+        } else if (arg == "--calib-frames" && i + 1 < argc) {
+            dump_calib_frames = std::stoi(argv[++i]);
         } else {
             bin_files.push_back(arg);
         }
@@ -113,9 +151,12 @@ int main(int argc, char** argv) {
     if (bin_files.empty()) {
         std::cerr << "Usage: infer_pipeline <file.bin> [...] [--file-list files.txt]\n"
                   << "                       [--json out.json]\n"
-                  << "                       [--benchmark [--warmup N] [--bench-iters N] [--bench-output bench.json]]\n";
+                  << "                       [--benchmark [--warmup N] [--bench-iters N] [--bench-output bench.json]]\n"
+                  << "                       [--dump-calib-dir <dir> [--calib-frames N]]\n";
         return 1;
     }
+    if (!dump_calib_dir.empty() && dump_calib_frames <= 0) dump_calib_frames = 32;
+    int dump_calib_count = 0;
 
     InferContext pfn_ctx("/workspace/engines/pfn_fp16.plan");
     InferContext bb_ctx("/workspace/engines/backbone_head_fp16.plan");
@@ -208,6 +249,28 @@ int main(int argc, char** argv) {
             if (P > MAX_PILLARS) P = MAX_PILLARS;
             if (timer) timer->end("pillarize");
 
+            // dump PFN 输入（CUDA 路径）：从 pfn_ctx device buffer D2H，零 pad 到 OPT_P
+            if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
+                int P_dump = std::min(P, OPT_P);
+                std::vector<float> h_features((size_t)OPT_P * MAX_PTS * C_IN, 0.0f);
+                std::vector<float> h_mask((size_t)OPT_P * MAX_PTS, 0.0f);
+                cudaMemcpy(h_features.data(),
+                           pfn_ctx.getDeviceBuffer("pillar_features"),
+                           (size_t)P_dump * MAX_PTS * C_IN * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_mask.data(),
+                           pfn_ctx.getDeviceBuffer("pillar_mask"),
+                           (size_t)P_dump * MAX_PTS * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+                char fn[256];
+                snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_features.bin",
+                         dump_calib_dir.c_str(), dump_calib_count);
+                writeCalibBin(fn, h_features.data(), h_features.size() * sizeof(float));
+                snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_mask.bin",
+                         dump_calib_dir.c_str(), dump_calib_count);
+                writeCalibBin(fn, h_mask.data(), h_mask.size() * sizeof(float));
+            }
+
             if (timer) timer->begin("pfn");
             pfn_ctx.setInputShape("pillar_features", {P, MAX_PTS, C_IN});
             pfn_ctx.setInputShape("pillar_mask",     {P, MAX_PTS});
@@ -221,6 +284,24 @@ int main(int argc, char** argv) {
                 VX, VY, VZ, MAX_PTS, MAX_PILLARS);
             P = batch.P;
             if (timer) timer->end("pillarize");
+
+            // dump PFN 输入（CPU 路径）：直接从 batch host buffer 读，零 pad 到 OPT_P
+            if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
+                int P_dump = std::min(P, OPT_P);
+                std::vector<float> h_features((size_t)OPT_P * MAX_PTS * C_IN, 0.0f);
+                std::vector<float> h_mask((size_t)OPT_P * MAX_PTS, 0.0f);
+                std::memcpy(h_features.data(), batch.features.data(),
+                            (size_t)P_dump * MAX_PTS * C_IN * sizeof(float));
+                std::memcpy(h_mask.data(), batch.mask.data(),
+                            (size_t)P_dump * MAX_PTS * sizeof(float));
+                char fn[256];
+                snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_features.bin",
+                         dump_calib_dir.c_str(), dump_calib_count);
+                writeCalibBin(fn, h_features.data(), h_features.size() * sizeof(float));
+                snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_mask.bin",
+                         dump_calib_dir.c_str(), dump_calib_count);
+                writeCalibBin(fn, h_mask.data(), h_mask.size() * sizeof(float));
+            }
 
             if (timer) timer->begin("h2d_coords");
             cudaMemcpy(d_coords, batch.coords.data(), P * 4 * sizeof(int),
@@ -246,6 +327,18 @@ int main(int argc, char** argv) {
         launchPillarScatter(d_emb, d_coords, d_canvas, P, C_OUT, BEV_H, BEV_W, stream);
         cudaStreamSynchronize(stream);
         if (timer) timer->end("scatter");
+
+        // dump Backbone 输入（散射后 BEV，静态 [1,64,512,512]）；与本帧 PFN dump 配对
+        if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
+            std::vector<float> h_canvas((size_t)C_OUT * BEV_H * BEV_W);
+            cudaMemcpy(h_canvas.data(), d_canvas,
+                       h_canvas.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            char fn[256];
+            snprintf(fn, sizeof(fn), "%s/frame_%03d_spatial_features.bin",
+                     dump_calib_dir.c_str(), dump_calib_count);
+            writeCalibBin(fn, h_canvas.data(), h_canvas.size() * sizeof(float));
+            dump_calib_count++;  // 一帧的 3 个 binding 全部 dump 完后再 +1
+        }
 
         if (timer) timer->begin("backbone");
         bb_ctx.infer();
@@ -352,29 +445,57 @@ int main(int argc, char** argv) {
 
     if (benchmark) {
         std::cerr << "[benchmark] preloading " << bin_files.size()
-                  << " bin files into memory (excluded from timing)...\n";
-        std::vector<std::vector<float>> preloaded;
+                  << " bin files into "
+                  << (pinned_points ? "pinned" : "pageable")
+                  << " memory (excluded from timing)...\n";
+
+        // 两路存储：pinned 或 pageable（互斥）
+        std::vector<std::vector<float>> preloaded_pageable;
+        std::vector<float*>             preloaded_pinned;
         std::vector<int> preloaded_N;
-        preloaded.reserve(bin_files.size());
         preloaded_N.reserve(bin_files.size());
-        for (const auto& p : bin_files) {
-            int N;
-            preloaded.push_back(loadBin(p, N));
-            preloaded_N.push_back(N);
+
+        size_t total_pinned_bytes = 0;
+        if (pinned_points) {
+            preloaded_pinned.reserve(bin_files.size());
+            for (const auto& p : bin_files) {
+                float* buf = nullptr;
+                size_t cap = 0;
+                int N = loadBinIntoPinned(p, buf, cap);
+                preloaded_pinned.push_back(buf);
+                preloaded_N.push_back(N);
+                total_pinned_bytes += cap;
+            }
+            std::cerr << "[benchmark] preloaded pinned host "
+                      << total_pinned_bytes / (1024*1024) << " MB\n";
+        } else {
+            preloaded_pageable.reserve(bin_files.size());
+            for (const auto& p : bin_files) {
+                int N;
+                preloaded_pageable.push_back(loadBin(p, N));
+                preloaded_N.push_back(N);
+            }
         }
+
         std::cerr << "[benchmark] warmup=" << warmup_iters
                   << "  iters=" << bench_iters << "\n";
 
+        auto getPts = [&](int idx) -> const float* {
+            return pinned_points ? preloaded_pinned[idx]
+                                 : preloaded_pageable[idx].data();
+        };
+
         StageTimer timer;
+        int n_files = (int)preloaded_N.size();
         for (int i = 0; i < warmup_iters; i++) {
-            int idx = i % (int)preloaded.size();
-            (void)runOneFrame(preloaded[idx].data(), preloaded_N[idx], nullptr);
+            int idx = i % n_files;
+            (void)runOneFrame(getPts(idx), preloaded_N[idx], nullptr);
         }
         cudaDeviceSynchronize();
 
         for (int i = 0; i < bench_iters; i++) {
-            int idx = i % (int)preloaded.size();
-            (void)runOneFrame(preloaded[idx].data(), preloaded_N[idx], &timer);
+            int idx = i % n_files;
+            (void)runOneFrame(getPts(idx), preloaded_N[idx], &timer);
             timer.commitFrame();
         }
 
@@ -383,6 +504,10 @@ int main(int argc, char** argv) {
             timer.writeJson(bench_output);
             std::cerr << "[benchmark] wrote " << bench_output << "\n";
         }
+
+        if (pinned_points) {
+            for (auto* p : preloaded_pinned) cudaFreeHost(p);
+        }
     } else {
         std::ofstream jf;
         if (!json_path.empty()) {
@@ -390,14 +515,26 @@ int main(int argc, char** argv) {
             jf << "{\n";
         }
 
+        // 单帧路径用一个共享 pinned scratch buffer，按需扩容（首帧分配后稳态零开销）
+        float*  h_pinned_scratch = nullptr;
+        size_t  pinned_scratch_cap = 0;
+
         int total = (int)bin_files.size();
         for (int fi = 0; fi < total; fi++) {
             const auto& bin_path = bin_files[fi];
 
             int N;
-            auto pts = loadBin(bin_path, N);
+            const float* pts_ptr;
+            std::vector<float> pts_pageable;
+            if (pinned_points) {
+                N = loadBinIntoPinned(bin_path, h_pinned_scratch, pinned_scratch_cap);
+                pts_ptr = h_pinned_scratch;
+            } else {
+                pts_pageable = loadBin(bin_path, N);
+                pts_ptr = pts_pageable.data();
+            }
 
-            auto all_dets = runOneFrame(pts.data(), N, nullptr);
+            auto all_dets = runOneFrame(pts_ptr, N, nullptr);
 
             if (!json_path.empty()) {
                 writeFrameJson(jf, bin_path, all_dets);
@@ -423,6 +560,24 @@ int main(int argc, char** argv) {
             jf << "}\n";
             std::cerr << "JSON written to " << json_path << "\n";
         }
+
+        if (h_pinned_scratch) cudaFreeHost(h_pinned_scratch);
+    }
+
+    if (!dump_calib_dir.empty()) {
+        std::ofstream mf(dump_calib_dir + "/manifest.txt");
+        mf << "num_frames " << dump_calib_count << "\n"
+           << "opt_p "      << OPT_P << "\n"
+           << "max_pts "    << MAX_PTS << "\n"
+           << "c_in "       << C_IN << "\n"
+           << "c_out "      << C_OUT << "\n"
+           << "bev_h "      << BEV_H << "\n"
+           << "bev_w "      << BEV_W << "\n"
+           << "pfn_features_shape " << OPT_P << " " << MAX_PTS << " " << C_IN << "\n"
+           << "pfn_mask_shape "     << OPT_P << " " << MAX_PTS << "\n"
+           << "bb_input_shape 1 "   << C_OUT << " " << BEV_H << " " << BEV_W << "\n";
+        std::cerr << "[calib] dumped " << dump_calib_count
+                  << " frames to " << dump_calib_dir << "\n";
     }
 
     cudaFree(d_coords);

@@ -34,7 +34,8 @@ bool buildEngine(const std::string& onnx_path,
                  const std::string& engine_path,
                  bool fp16,
                  size_t workspace_gb,
-                 const std::vector<DynamicShapeProfile>& profiles)
+                 const std::vector<DynamicShapeProfile>& profiles,
+                 nvinfer1::IInt8Calibrator* calibrator)
 {
     TRTLogger logger;
 
@@ -81,6 +82,13 @@ bool buildEngine(const std::string& onnx_path,
     if (fp16) {
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
         std::cout << "FP16 已启用\n";
+    }
+    if (calibrator) {
+        // INT8 主精度；同时打开 FP16 让无法 INT8 化的层 fallback，避免 FP32 兜底
+        config->setFlag(nvinfer1::BuilderFlag::kINT8);
+        config->setFlag(nvinfer1::BuilderFlag::kFP16);
+        config->setInt8Calibrator(calibrator);
+        std::cout << "INT8 已启用（FP16 fallback）\n";
     }
 
     // 5. Optimization Profile（仅动态输入时需要）

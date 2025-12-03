@@ -1,15 +1,83 @@
 #include "engine_builder.h"
 #include "scatter_plugin.h"
+#include "calibrator.h"
+#include <cstring>
 #include <iostream>
 #include <string>
+#include <vector>
 
+// 构建模式：
+//   无参数：FP16 构建 backbone+head / PFN / e2e 三个 engine（保持原行为）
+//   --int8-pfn <calib_dir>：仅构建 PFN INT8，从 calib_dir 读 dump 数据
+//   --int8-bb  <calib_dir>：仅构建 backbone+head INT8
+// e2e 引擎 INT8 暂不实现（calibrator 喂 features+mask+coords 三路、且 P 动态需
+// 单独 dump；先把分步 engine 的代码路径打通）。
 int main(int argc, char* argv[])
 {
-    // 进程启动时把 PillarScatter creator 注册进 PluginRegistry。
-    // 即使本次只构建 PFN/backbone（不含 plugin），多注册一次也无副作用。
     centerpoint_trt::registerPillarScatterPlugin();
 
-    // backbone+head（静态输入）
+    std::string int8_pfn_dir, int8_bb_dir;
+    int calib_frames = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--int8-pfn") == 0 && i + 1 < argc) {
+            int8_pfn_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--int8-bb") == 0 && i + 1 < argc) {
+            int8_bb_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--calib-frames") == 0 && i + 1 < argc) {
+            calib_frames = std::stoi(argv[++i]);
+        }
+    }
+
+    // ── INT8 PFN ─────────────────────────────────────────────────────────────
+    if (!int8_pfn_dir.empty()) {
+        int n = calib_frames > 0 ? calib_frames : 32;
+        // OPT_P=12000, MAX_PTS=20, C_IN=11
+        constexpr size_t FEAT_BYTES = (size_t)12000 * 20 * 11 * sizeof(float);
+        constexpr size_t MASK_BYTES = (size_t)12000 * 20 * sizeof(float);
+        std::vector<CalibInput> ins = {
+            {"pillar_features", "pillar_features", FEAT_BYTES},
+            {"pillar_mask",     "pillar_mask",     MASK_BYTES},
+        };
+        CenterPointCalibrator calib(ins, int8_pfn_dir, n,
+                                    "/workspace/engines/calib_pfn.cache");
+        bool ok = buildEngine(
+            "/workspace/onnx/pfn.onnx",
+            "/workspace/engines/pfn_int8.plan",
+            /*fp16=*/false,  // INT8 模式下 buildEngine 内部会同时打开 FP16 fallback
+            /*workspace_gb=*/2,
+            {
+                {"pillar_features", {1000,20,11}, {12000,20,11}, {30000,20,11}},
+                {"pillar_mask",     {1000,20},    {12000,20},    {30000,20}},
+            },
+            &calib);
+        if (!ok) { std::cerr << "PFN INT8 构建失败\n"; return 1; }
+        std::cout << "PFN INT8 构建完成\n";
+        return 0;
+    }
+
+    // ── INT8 backbone+head ───────────────────────────────────────────────────
+    if (!int8_bb_dir.empty()) {
+        int n = calib_frames > 0 ? calib_frames : 32;
+        constexpr size_t BB_BYTES = (size_t)1 * 64 * 512 * 512 * sizeof(float);
+        std::vector<CalibInput> ins = {
+            {"spatial_features", "spatial_features", BB_BYTES},
+        };
+        CenterPointCalibrator calib(ins, int8_bb_dir, n,
+                                    "/workspace/engines/calib_bb.cache");
+        bool ok = buildEngine(
+            "/workspace/onnx/backbone_head.onnx",
+            "/workspace/engines/backbone_head_int8.plan",
+            /*fp16=*/false,
+            /*workspace_gb=*/2,
+            /*profiles=*/{},
+            &calib);
+        if (!ok) { std::cerr << "backbone+head INT8 构建失败\n"; return 1; }
+        std::cout << "backbone+head INT8 构建完成\n";
+        return 0;
+    }
+
+    // ── 默认 FP16 构建（无 INT8 标志时的原行为） ────────────────────────────
     bool ok = buildEngine(
         "/workspace/onnx/backbone_head.onnx",
         "/workspace/engines/backbone_head_fp16.plan",
@@ -17,12 +85,8 @@ int main(int argc, char* argv[])
         /*workspace_gb=*/2,
         /*profiles=*/{}
     );
-    if (!ok)
-    {
-        std::cerr << "backbone engine 构建失败\n"; return 1;
-    }
+    if (!ok) { std::cerr << "backbone engine 构建失败\n"; return 1; }
 
-    // PFN（动态 pillar 数量，来自 pillar 统计结果）
     ok = buildEngine(
         "/workspace/onnx/pfn.onnx",
         "/workspace/engines/pfn_fp16.plan",
@@ -33,13 +97,8 @@ int main(int argc, char* argv[])
             {"pillar_mask",     {1000,20},    {12000,20},    {30000,20}},
         }
     );
+    if (!ok) { std::cerr << "PFN engine 构建失败\n"; return 1; }
 
-    if (!ok)
-    {
-        std::cerr << "PFN engine 构建失败\n"; return 1;
-    }
-
-    // 端到端单引擎（含 PillarScatter plugin）
     ok = buildEngine(
         "/workspace/onnx/centerpoint_e2e.onnx",
         "/workspace/engines/centerpoint_e2e_fp16.plan",
@@ -51,10 +110,7 @@ int main(int argc, char* argv[])
             {"pillar_coords",   {1000,4},     {12000,4},     {30000,4}},
         }
     );
-    if (!ok)
-    {
-        std::cerr << "端到端 engine 构建失败\n"; return 1;
-    }
+    if (!ok) { std::cerr << "端到端 engine 构建失败\n"; return 1; }
 
     std::cout << "全部 engine 构建完成\n";
     return 0;
