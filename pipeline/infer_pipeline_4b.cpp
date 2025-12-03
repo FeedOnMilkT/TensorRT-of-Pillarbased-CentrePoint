@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,23 @@ static std::vector<float> loadBin(const std::string& path, int& N) {
     std::vector<float> pts(N * 5);
     f.read(reinterpret_cast<char*>(pts.data()), bytes);
     return pts;
+}
+
+// 直接读到一个预分配的 pinned host buffer 里。容量不够时按需 cudaMallocHost 扩容。
+// 用于 --pinned-points 路径，省掉 std::vector 中转和 cudaMemcpyAsync 内部的 bounce 拷贝。
+static int loadBinIntoPinned(const std::string& path,
+                             float*& pinned, size_t& pinned_capacity_bytes) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("无法打开: " + path);
+    size_t bytes = f.tellg();
+    f.seekg(0);
+    if (bytes > pinned_capacity_bytes) {
+        if (pinned) cudaFreeHost(pinned);
+        pinned_capacity_bytes = bytes + (bytes >> 2);  // 25% slack 减少抖动期重分配
+        cudaHostAlloc(&pinned, pinned_capacity_bytes, cudaHostAllocDefault);
+    }
+    f.read(reinterpret_cast<char*>(pinned), bytes);
+    return (int)(bytes / (5 * sizeof(float)));
 }
 
 static void writeFrameJson(std::ostream& os,
@@ -88,6 +106,7 @@ int main(int argc, char** argv) {
     std::string bench_output;
     bool cuda_pillarize = false;
     bool cuda_postprocess = false;
+    bool pinned_points = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -99,6 +118,7 @@ int main(int argc, char** argv) {
         else if (arg == "--bench-output" && i + 1 < argc) bench_output = argv[++i];
         else if (arg == "--cuda-pillarize")               cuda_pillarize = true;
         else if (arg == "--cuda-postprocess")             cuda_postprocess = true;
+        else if (arg == "--pinned-points")                pinned_points = true;
         else                                              bin_files.push_back(arg);
     }
 
@@ -112,7 +132,7 @@ int main(int argc, char** argv) {
     if (bin_files.empty()) {
         std::cerr << "Usage: infer_pipeline_4b <file.bin> [...] [--file-list files.txt]\n"
                   << "                          [--json out.json]\n"
-                  << "                          [--cuda-pillarize] [--cuda-postprocess]\n"
+                  << "                          [--cuda-pillarize] [--cuda-postprocess] [--pinned-points]\n"
                   << "                          [--benchmark [--warmup N] [--bench-iters N] [--bench-output bench.json]]\n";
         return 1;
     }
@@ -322,29 +342,56 @@ int main(int argc, char** argv) {
 
     if (benchmark) {
         std::cerr << "[benchmark] preloading " << bin_files.size()
-                  << " bin files into memory (excluded from timing)...\n";
-        std::vector<std::vector<float>> preloaded;
+                  << " bin files into "
+                  << (pinned_points ? "pinned" : "pageable")
+                  << " memory (excluded from timing)...\n";
+
+        // 两路存储：pinned 或 pageable（互斥）
+        std::vector<std::vector<float>> preloaded_pageable;
+        std::vector<float*>             preloaded_pinned;
         std::vector<int> preloaded_N;
-        preloaded.reserve(bin_files.size());
         preloaded_N.reserve(bin_files.size());
-        for (const auto& p : bin_files) {
-            int N;
-            preloaded.push_back(loadBin(p, N));
-            preloaded_N.push_back(N);
+
+        size_t total_pinned_bytes = 0;
+        if (pinned_points) {
+            preloaded_pinned.reserve(bin_files.size());
+            for (const auto& p : bin_files) {
+                float* buf = nullptr;
+                size_t cap = 0;
+                int N = loadBinIntoPinned(p, buf, cap);
+                preloaded_pinned.push_back(buf);
+                preloaded_N.push_back(N);
+                total_pinned_bytes += cap;
+            }
+            std::cerr << "[benchmark] preloaded pinned host "
+                      << total_pinned_bytes / (1024*1024) << " MB\n";
+        } else {
+            preloaded_pageable.reserve(bin_files.size());
+            for (const auto& p : bin_files) {
+                int N;
+                preloaded_pageable.push_back(loadBin(p, N));
+                preloaded_N.push_back(N);
+            }
         }
         std::cerr << "[benchmark] warmup=" << warmup_iters
                   << "  iters=" << bench_iters << "\n";
 
+        auto getPts = [&](int idx) -> const float* {
+            return pinned_points ? preloaded_pinned[idx]
+                                 : preloaded_pageable[idx].data();
+        };
+
         StageTimer timer;
+        int n_files = (int)preloaded_N.size();
         for (int i = 0; i < warmup_iters; i++) {
-            int idx = i % (int)preloaded.size();
-            (void)runOneFrame(preloaded[idx].data(), preloaded_N[idx], nullptr);
+            int idx = i % n_files;
+            (void)runOneFrame(getPts(idx), preloaded_N[idx], nullptr);
         }
         cudaDeviceSynchronize();
 
         for (int i = 0; i < bench_iters; i++) {
-            int idx = i % (int)preloaded.size();
-            (void)runOneFrame(preloaded[idx].data(), preloaded_N[idx], &timer);
+            int idx = i % n_files;
+            (void)runOneFrame(getPts(idx), preloaded_N[idx], &timer);
             timer.commitFrame();
         }
 
@@ -353,6 +400,10 @@ int main(int argc, char** argv) {
             timer.writeJson(bench_output);
             std::cerr << "[benchmark] wrote " << bench_output << "\n";
         }
+
+        if (pinned_points) {
+            for (auto* p : preloaded_pinned) cudaFreeHost(p);
+        }
     } else {
         std::ofstream jf;
         if (!json_path.empty()) {
@@ -360,12 +411,26 @@ int main(int argc, char** argv) {
             jf << "{\n";
         }
 
+        // 单帧路径用一个共享 pinned scratch buffer，按需扩容（首帧分配后稳态零开销）
+        float* h_pinned_scratch = nullptr;
+        size_t pinned_scratch_cap = 0;
+
         int total = (int)bin_files.size();
         for (int fi = 0; fi < total; fi++) {
             const auto& bin_path = bin_files[fi];
+
             int N;
-            auto pts = loadBin(bin_path, N);
-            auto all_dets = runOneFrame(pts.data(), N, nullptr);
+            const float* pts_ptr;
+            std::vector<float> pts_pageable;
+            if (pinned_points) {
+                N = loadBinIntoPinned(bin_path, h_pinned_scratch, pinned_scratch_cap);
+                pts_ptr = h_pinned_scratch;
+            } else {
+                pts_pageable = loadBin(bin_path, N);
+                pts_ptr = pts_pageable.data();
+            }
+
+            auto all_dets = runOneFrame(pts_ptr, N, nullptr);
 
             if (!json_path.empty()) {
                 writeFrameJson(jf, bin_path, all_dets);
@@ -391,6 +456,8 @@ int main(int argc, char** argv) {
             jf << "}\n";
             std::cerr << "JSON written to " << json_path << "\n";
         }
+
+        if (h_pinned_scratch) cudaFreeHost(h_pinned_scratch);
     }
 
     if (cuda_pillarize) {
