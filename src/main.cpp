@@ -10,13 +10,12 @@
 //   无参数：FP16 构建 backbone+head / PFN / e2e 三个 engine（保持原行为）
 //   --int8-pfn <calib_dir>：仅构建 PFN INT8，从 calib_dir 读 dump 数据
 //   --int8-bb  <calib_dir>：仅构建 backbone+head INT8
-// e2e 引擎 INT8 暂不实现（calibrator 喂 features+mask+coords 三路、且 P 动态需
-// 单独 dump；先把分步 engine 的代码路径打通）。
+//   --int8-e2e <calib_dir>：仅构建 e2e INT8，从 calib_dir 读三路 dump 数据
 int main(int argc, char* argv[])
 {
     centerpoint_trt::registerPillarScatterPlugin();
 
-    std::string int8_pfn_dir, int8_bb_dir;
+    std::string int8_pfn_dir, int8_bb_dir, int8_e2e_dir;
     int calib_frames = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -24,6 +23,8 @@ int main(int argc, char* argv[])
             int8_pfn_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--int8-bb") == 0 && i + 1 < argc) {
             int8_bb_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--int8-e2e") == 0 && i + 1 < argc) {
+            int8_e2e_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--calib-frames") == 0 && i + 1 < argc) {
             calib_frames = std::stoi(argv[++i]);
         }
@@ -74,6 +75,35 @@ int main(int argc, char* argv[])
             &calib);
         if (!ok) { std::cerr << "backbone+head INT8 构建失败\n"; return 1; }
         std::cout << "backbone+head INT8 构建完成\n";
+        return 0;
+    }
+
+    // ── INT8 e2e (PFN + scatter plugin + backbone+head) ─────────────────────
+    if (!int8_e2e_dir.empty()) {
+        int n = calib_frames > 0 ? calib_frames : 32;
+        constexpr size_t FEAT_BYTES  = (size_t)12000 * 20 * 11 * sizeof(float);
+        constexpr size_t MASK_BYTES  = (size_t)12000 * 20 * sizeof(float);
+        constexpr size_t COORD_BYTES = (size_t)12000 * 4 * sizeof(int);
+        std::vector<CalibInput> ins = {
+            {"pillar_features", "pillar_features", FEAT_BYTES},
+            {"pillar_mask",     "pillar_mask",     MASK_BYTES},
+            {"pillar_coords",   "pillar_coords",   COORD_BYTES},
+        };
+        CenterPointCalibrator calib(ins, int8_e2e_dir, n,
+                                    "/workspace/engines/calib_e2e.cache");
+        bool ok = buildEngine(
+            "/workspace/onnx/centerpoint_e2e.onnx",
+            "/workspace/engines/centerpoint_e2e_int8.plan",
+            /*fp16=*/false,
+            /*workspace_gb=*/2,
+            {
+                {"pillar_features", {1000,20,11}, {12000,20,11}, {30000,20,11}},
+                {"pillar_mask",     {1000,20},    {12000,20},    {30000,20}},
+                {"pillar_coords",   {1000,4},     {12000,4},     {30000,4}},
+            },
+            &calib);
+        if (!ok) { std::cerr << "e2e INT8 构建失败\n"; return 1; }
+        std::cout << "e2e INT8 构建完成\n";
         return 0;
     }
 

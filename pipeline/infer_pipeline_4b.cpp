@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
 
     std::string json_path;
     std::string file_list_path;
+    std::string engine_path = "/workspace/engines/centerpoint_e2e_fp16.plan";
     std::vector<std::string> bin_files;
 
     bool benchmark = false;
@@ -112,6 +113,7 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--json" && i + 1 < argc)              json_path = argv[++i];
         else if (arg == "--file-list" && i + 1 < argc)    file_list_path = argv[++i];
+        else if (arg == "--engine" && i + 1 < argc)       engine_path = argv[++i];
         else if (arg == "--benchmark")                    benchmark = true;
         else if (arg == "--warmup" && i + 1 < argc)       warmup_iters = std::stoi(argv[++i]);
         else if (arg == "--bench-iters" && i + 1 < argc)  bench_iters = std::stoi(argv[++i]);
@@ -131,13 +133,14 @@ int main(int argc, char** argv) {
 
     if (bin_files.empty()) {
         std::cerr << "Usage: infer_pipeline_4b <file.bin> [...] [--file-list files.txt]\n"
+                  << "                          [--engine path/to/engine.plan]\n"
                   << "                          [--json out.json]\n"
                   << "                          [--cuda-pillarize] [--cuda-postprocess] [--pinned-points]\n"
                   << "                          [--benchmark [--warmup N] [--bench-iters N] [--bench-output bench.json]]\n";
         return 1;
     }
 
-    InferContext e2e_ctx("/workspace/engines/centerpoint_e2e_fp16.plan");
+    InferContext e2e_ctx(engine_path);
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);

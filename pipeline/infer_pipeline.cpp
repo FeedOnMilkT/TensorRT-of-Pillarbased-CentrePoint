@@ -64,8 +64,8 @@ static int loadBinIntoPinned(const std::string& path,
     return (int)(bytes / (5 * sizeof(float)));
 }
 
-// INT8 校准张量 dump：所有帧统一 pad/截断到 OPT 形状（OPT_P = 12000），
-// pad 区 mask=0、features=0，不影响 PFN 行为；这样校准期 TRT 直接按 OPT 形状走。
+// INT8 校准张量 dump：所有帧统一 pad/截断到 OPT 形状（OPT_P = 12000）。
+// pad 区 mask/features/coords 全置 0；这样校准期 TRT 直接按 OPT shape 走。
 static constexpr int OPT_P = 12000;
 
 static void writeCalibBin(const std::string& path, const void* data, size_t bytes) {
@@ -249,11 +249,12 @@ int main(int argc, char** argv) {
             if (P > MAX_PILLARS) P = MAX_PILLARS;
             if (timer) timer->end("pillarize");
 
-            // dump PFN 输入（CUDA 路径）：从 pfn_ctx device buffer D2H，零 pad 到 OPT_P
+            // dump PFN/e2e 输入（CUDA 路径）：从 device buffer D2H，零 pad 到 OPT_P
             if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
                 int P_dump = std::min(P, OPT_P);
                 std::vector<float> h_features((size_t)OPT_P * MAX_PTS * C_IN, 0.0f);
                 std::vector<float> h_mask((size_t)OPT_P * MAX_PTS, 0.0f);
+                std::vector<int> h_coords((size_t)OPT_P * 4, 0);
                 cudaMemcpy(h_features.data(),
                            pfn_ctx.getDeviceBuffer("pillar_features"),
                            (size_t)P_dump * MAX_PTS * C_IN * sizeof(float),
@@ -262,6 +263,9 @@ int main(int argc, char** argv) {
                            pfn_ctx.getDeviceBuffer("pillar_mask"),
                            (size_t)P_dump * MAX_PTS * sizeof(float),
                            cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_coords.data(), d_coords,
+                           (size_t)P_dump * 4 * sizeof(int),
+                           cudaMemcpyDeviceToHost);
                 char fn[256];
                 snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_features.bin",
                          dump_calib_dir.c_str(), dump_calib_count);
@@ -269,6 +273,9 @@ int main(int argc, char** argv) {
                 snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_mask.bin",
                          dump_calib_dir.c_str(), dump_calib_count);
                 writeCalibBin(fn, h_mask.data(), h_mask.size() * sizeof(float));
+                snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_coords.bin",
+                         dump_calib_dir.c_str(), dump_calib_count);
+                writeCalibBin(fn, h_coords.data(), h_coords.size() * sizeof(int));
             }
 
             if (timer) timer->begin("pfn");
@@ -285,15 +292,18 @@ int main(int argc, char** argv) {
             P = batch.P;
             if (timer) timer->end("pillarize");
 
-            // dump PFN 输入（CPU 路径）：直接从 batch host buffer 读，零 pad 到 OPT_P
+            // dump PFN/e2e 输入（CPU 路径）：直接从 batch host buffer 读，零 pad 到 OPT_P
             if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
                 int P_dump = std::min(P, OPT_P);
                 std::vector<float> h_features((size_t)OPT_P * MAX_PTS * C_IN, 0.0f);
                 std::vector<float> h_mask((size_t)OPT_P * MAX_PTS, 0.0f);
+                std::vector<int> h_coords((size_t)OPT_P * 4, 0);
                 std::memcpy(h_features.data(), batch.features.data(),
                             (size_t)P_dump * MAX_PTS * C_IN * sizeof(float));
                 std::memcpy(h_mask.data(), batch.mask.data(),
                             (size_t)P_dump * MAX_PTS * sizeof(float));
+                std::memcpy(h_coords.data(), batch.coords.data(),
+                            (size_t)P_dump * 4 * sizeof(int));
                 char fn[256];
                 snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_features.bin",
                          dump_calib_dir.c_str(), dump_calib_count);
@@ -301,6 +311,9 @@ int main(int argc, char** argv) {
                 snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_mask.bin",
                          dump_calib_dir.c_str(), dump_calib_count);
                 writeCalibBin(fn, h_mask.data(), h_mask.size() * sizeof(float));
+                snprintf(fn, sizeof(fn), "%s/frame_%03d_pillar_coords.bin",
+                         dump_calib_dir.c_str(), dump_calib_count);
+                writeCalibBin(fn, h_coords.data(), h_coords.size() * sizeof(int));
             }
 
             if (timer) timer->begin("h2d_coords");
@@ -575,6 +588,7 @@ int main(int argc, char** argv) {
            << "bev_w "      << BEV_W << "\n"
            << "pfn_features_shape " << OPT_P << " " << MAX_PTS << " " << C_IN << "\n"
            << "pfn_mask_shape "     << OPT_P << " " << MAX_PTS << "\n"
+           << "e2e_coords_shape "   << OPT_P << " 4\n"
            << "bb_input_shape 1 "   << C_OUT << " " << BEV_H << " " << BEV_W << "\n";
         std::cerr << "[calib] dumped " << dump_calib_count
                   << " frames to " << dump_calib_dir << "\n";
