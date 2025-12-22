@@ -1,5 +1,17 @@
+// 统一推理 pipeline：通过 --mode {4a,4b} 在两条路径间切换。
+//   4a：pfn_engine + 显式 scatter CUDA kernel + backbone+head_engine
+//   4b：单一 e2e_engine（PillarScatter 已封装为 IPluginV3，scatter 在图内）
+//
+// 除推理中段外，其他全部共享：参数解析、CUDA pillarize/postprocess workspace、
+// pinned 点云加载、INT8 校准 dump、benchmark 与单帧 JSON 输出循环。
+//
+// 校准 dump 在两个 mode 都可用：features/mask/coords 三路从 pillarize 写入的
+// device buffer D2H（CUDA 路径）或 host batch（CPU 路径）落盘。spatial_features
+// 仅 4a 有意义（4b 内部 scatter 中间结果不可见），dump 自然只在 4a 触发。
+
 #include "infer_context.h"
 #include "scatter_kernel.h"
+#include "scatter_plugin.h"
 #include "pillarize.h"
 #include "pillarize_cuda.h"
 #include "postprocess.h"
@@ -11,6 +23,7 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <memory>
 #include <iomanip>
 #include <cstring>
 #include <cstdio>
@@ -29,7 +42,7 @@ static constexpr float SCORE_THRESH = 0.1f;
 
 static const int   TASK_NUM_CLS[6]    = {1, 2, 2, 1, 2, 2};
 static const float TASK_NMS_RADIUS[6] = {2.0f, 4.0f, 6.0f, 0.5f, 1.5f, 0.5f};
-static constexpr int MAX_CANDS_PER_TASK = 4096;  // peak filter 后通常 < 几百，此 buffer 远超
+static constexpr int MAX_CANDS_PER_TASK = 4096;
 
 static const char* CLASS_NAMES[10] = {
     "car", "truck", "construction_vehicle", "bus", "trailer",
@@ -74,7 +87,6 @@ static void writeCalibBin(const std::string& path, const void* data, size_t byte
     f.write(reinterpret_cast<const char*>(data), bytes);
 }
 
-// 把一帧的 detections 追加到 JSON 流（调用方管理逗号分隔）
 static void writeFrameJson(std::ostream& os,
                            const std::string& key,
                            const std::vector<Detection>& dets) {
@@ -95,7 +107,13 @@ static void writeFrameJson(std::ostream& os,
     os << "  ]";
 }
 
+enum Mode { M4A, M4B };
+
 int main(int argc, char** argv) {
+    Mode mode = M4A;
+    std::string pfn_engine_path = "/workspace/engines/pfn_fp16.plan";
+    std::string bb_engine_path  = "/workspace/engines/backbone_head_fp16.plan";
+    std::string e2e_engine_path = "/workspace/engines/centerpoint_e2e_fp16.plan";
     std::string json_path;
     std::string file_list_path;
     std::vector<std::string> bin_files;
@@ -112,31 +130,27 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--json" && i + 1 < argc) {
-            json_path = argv[++i];
-        } else if (arg == "--file-list" && i + 1 < argc) {
-            file_list_path = argv[++i];
-        } else if (arg == "--benchmark") {
-            benchmark = true;
-        } else if (arg == "--warmup" && i + 1 < argc) {
-            warmup_iters = std::stoi(argv[++i]);
-        } else if (arg == "--bench-iters" && i + 1 < argc) {
-            bench_iters = std::stoi(argv[++i]);
-        } else if (arg == "--bench-output" && i + 1 < argc) {
-            bench_output = argv[++i];
-        } else if (arg == "--cuda-pillarize") {
-            cuda_pillarize = true;
-        } else if (arg == "--cuda-postprocess") {
-            cuda_postprocess = true;
-        } else if (arg == "--pinned-points") {
-            pinned_points = true;
-        } else if (arg == "--dump-calib-dir" && i + 1 < argc) {
-            dump_calib_dir = argv[++i];
-        } else if (arg == "--calib-frames" && i + 1 < argc) {
-            dump_calib_frames = std::stoi(argv[++i]);
-        } else {
-            bin_files.push_back(arg);
+        if (arg == "--mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if      (m == "4a") mode = M4A;
+            else if (m == "4b") mode = M4B;
+            else { std::cerr << "未知 mode: " << m << "（可选: 4a, 4b）\n"; return 1; }
         }
+        else if (arg == "--pfn-engine" && i + 1 < argc) pfn_engine_path = argv[++i];
+        else if (arg == "--bb-engine"  && i + 1 < argc) bb_engine_path  = argv[++i];
+        else if (arg == "--e2e-engine" && i + 1 < argc) e2e_engine_path = argv[++i];
+        else if (arg == "--json"       && i + 1 < argc) json_path = argv[++i];
+        else if (arg == "--file-list"  && i + 1 < argc) file_list_path = argv[++i];
+        else if (arg == "--benchmark") benchmark = true;
+        else if (arg == "--warmup"     && i + 1 < argc) warmup_iters = std::stoi(argv[++i]);
+        else if (arg == "--bench-iters" && i + 1 < argc) bench_iters = std::stoi(argv[++i]);
+        else if (arg == "--bench-output" && i + 1 < argc) bench_output = argv[++i];
+        else if (arg == "--cuda-pillarize")   cuda_pillarize = true;
+        else if (arg == "--cuda-postprocess") cuda_postprocess = true;
+        else if (arg == "--pinned-points")    pinned_points = true;
+        else if (arg == "--dump-calib-dir" && i + 1 < argc) dump_calib_dir = argv[++i];
+        else if (arg == "--calib-frames"   && i + 1 < argc) dump_calib_frames = std::stoi(argv[++i]);
+        else bin_files.push_back(arg);
     }
 
     if (!file_list_path.empty()) {
@@ -149,8 +163,12 @@ int main(int argc, char** argv) {
     }
 
     if (bin_files.empty()) {
-        std::cerr << "Usage: infer_pipeline <file.bin> [...] [--file-list files.txt]\n"
+        std::cerr << "Usage: infer_pipeline [--mode 4a|4b]  <file.bin> [...]\n"
+                  << "                       [--file-list files.txt]\n"
+                  << "                       [--pfn-engine PATH] [--bb-engine PATH]    (4a)\n"
+                  << "                       [--e2e-engine PATH]                       (4b)\n"
                   << "                       [--json out.json]\n"
+                  << "                       [--cuda-pillarize] [--cuda-postprocess] [--pinned-points]\n"
                   << "                       [--benchmark [--warmup N] [--bench-iters N] [--bench-output bench.json]]\n"
                   << "                       [--dump-calib-dir <dir> [--calib-frames N]]\n";
         return 1;
@@ -158,16 +176,28 @@ int main(int argc, char** argv) {
     if (!dump_calib_dir.empty() && dump_calib_frames <= 0) dump_calib_frames = 32;
     int dump_calib_count = 0;
 
-    InferContext pfn_ctx("/workspace/engines/pfn_fp16.plan");
-    InferContext bb_ctx("/workspace/engines/backbone_head_fp16.plan");
+    std::cerr << "[pipeline] mode=" << (mode == M4A ? "4a" : "4b") << "\n";
 
-    int* d_coords;
-    cudaMalloc(&d_coords, MAX_PILLARS * 4 * sizeof(int));
+    // ── Engine 加载 ─────────────────────────────────────────────────────────
+    std::unique_ptr<InferContext> pfn_ctx, bb_ctx, e2e_ctx;
+    if (mode == M4A) {
+        pfn_ctx = std::make_unique<InferContext>(pfn_engine_path);
+        bb_ctx  = std::make_unique<InferContext>(bb_engine_path);
+    } else {
+        centerpoint_trt::registerPillarScatterPlugin();
+        e2e_ctx = std::make_unique<InferContext>(e2e_engine_path);
+    }
+
+    // 4a 独立 d_coords：scatter kernel 从这里读 pillar→cell 的索引
+    int* d_coords = nullptr;
+    if (mode == M4A) {
+        cudaMalloc(&d_coords, MAX_PILLARS * 4 * sizeof(int));
+    }
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
 
-    // CUDA pillarize 路径需要的 workspace + 点云 device buffer + host pinned int 拿 P
+    // CUDA pillarize 路径需要的 workspace + 点云 device buffer + host pinned 拿 P
     float*        d_points = nullptr;
     int           d_points_capacity = 0;
     unsigned int* d_voxel_point_count = nullptr;
@@ -217,7 +247,25 @@ int main(int argc, char** argv) {
                        -> std::vector<Detection> {
         if (timer) timer->beginFrameGpu(stream);
 
+        // pillarize 输出目标：CPU/CUDA 两条路都把 features/mask/coords 写到这三个指针
+        // 4a：features/mask 是 pfn engine 的 input device buffer，coords 是独立 d_coords
+        // 4b：三个指针都来自 e2e engine 的 input device buffer
+        float* tgt_features;
+        float* tgt_mask;
+        int*   tgt_coords;
+        if (mode == M4A) {
+            tgt_features = static_cast<float*>(pfn_ctx->getDeviceBuffer("pillar_features"));
+            tgt_mask     = static_cast<float*>(pfn_ctx->getDeviceBuffer("pillar_mask"));
+            tgt_coords   = d_coords;
+        } else {
+            tgt_features = static_cast<float*>(e2e_ctx->getDeviceBuffer("pillar_features"));
+            tgt_mask     = static_cast<float*>(e2e_ctx->getDeviceBuffer("pillar_mask"));
+            tgt_coords   = static_cast<int*>(e2e_ctx->getDeviceBuffer("pillar_coords"));
+        }
+
         int P = 0;
+        PillarBatch batch;  // 仅 CPU pillarize 路径填充
+
         if (cuda_pillarize) {
             // 点云 H2D（按需扩容）
             if (timer) timer->begin("h2d_points");
@@ -230,40 +278,34 @@ int main(int argc, char** argv) {
                             cudaMemcpyHostToDevice, stream);
             if (timer) timer->end("h2d_points");
 
-            // pillarize 直接写到 PFN 的 input device buffer，零中间拷贝
+            // pillarize 直接写到 tgt_*，零中间拷贝
             if (timer) timer->begin("pillarize");
-            float* d_pfn_features = static_cast<float*>(
-                pfn_ctx.getDeviceBuffer("pillar_features"));
-            float* d_pfn_mask = static_cast<float*>(
-                pfn_ctx.getDeviceBuffer("pillar_mask"));
             launchPillarizeCuda(
                 d_points, N,
                 X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX,
                 VX, VY, VZ, BEV_H, BEV_W, MAX_PTS, MAX_PILLARS,
                 d_voxel_point_count, d_voxels_dense, d_voxel_features_compact,
                 d_voxel_num_points, d_pillar_num,
-                d_pfn_features, d_pfn_mask, d_coords,
+                tgt_features, tgt_mask, tgt_coords,
                 h_pillar_num, stream);
             cudaStreamSynchronize(stream);  // 等 h_pillar_num 可读
             P = static_cast<int>(*h_pillar_num);
             if (P > MAX_PILLARS) P = MAX_PILLARS;
             if (timer) timer->end("pillarize");
 
-            // dump PFN/e2e 输入（CUDA 路径）：从 device buffer D2H，零 pad 到 OPT_P
+            // dump features/mask/coords（CUDA 路径）：从 tgt_* D2H，零 pad 到 OPT_P
             if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
                 int P_dump = std::min(P, OPT_P);
                 std::vector<float> h_features((size_t)OPT_P * MAX_PTS * C_IN, 0.0f);
                 std::vector<float> h_mask((size_t)OPT_P * MAX_PTS, 0.0f);
-                std::vector<int> h_coords((size_t)OPT_P * 4, 0);
-                cudaMemcpy(h_features.data(),
-                           pfn_ctx.getDeviceBuffer("pillar_features"),
+                std::vector<int>   h_coords((size_t)OPT_P * 4, 0);
+                cudaMemcpy(h_features.data(), tgt_features,
                            (size_t)P_dump * MAX_PTS * C_IN * sizeof(float),
                            cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_mask.data(),
-                           pfn_ctx.getDeviceBuffer("pillar_mask"),
+                cudaMemcpy(h_mask.data(), tgt_mask,
                            (size_t)P_dump * MAX_PTS * sizeof(float),
                            cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_coords.data(), d_coords,
+                cudaMemcpy(h_coords.data(), tgt_coords,
                            (size_t)P_dump * 4 * sizeof(int),
                            cudaMemcpyDeviceToHost);
                 char fn[256];
@@ -277,27 +319,20 @@ int main(int argc, char** argv) {
                          dump_calib_dir.c_str(), dump_calib_count);
                 writeCalibBin(fn, h_coords.data(), h_coords.size() * sizeof(int));
             }
-
-            if (timer) timer->begin("pfn");
-            pfn_ctx.setInputShape("pillar_features", {P, MAX_PTS, C_IN});
-            pfn_ctx.setInputShape("pillar_mask",     {P, MAX_PTS});
-            // device buffer 已被 launchPillarizeCuda 填好，跳过 setInput 的 H2D
-            pfn_ctx.infer();
-            if (timer) timer->end("pfn");
         } else {
             if (timer) timer->begin("pillarize");
-            auto batch = pillarize(pts_ptr, N,
+            batch = pillarize(pts_ptr, N,
                 X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX,
                 VX, VY, VZ, MAX_PTS, MAX_PILLARS);
             P = batch.P;
             if (timer) timer->end("pillarize");
 
-            // dump PFN/e2e 输入（CPU 路径）：直接从 batch host buffer 读，零 pad 到 OPT_P
+            // dump features/mask/coords（CPU 路径）：直接从 batch host buffer 读，零 pad 到 OPT_P
             if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
                 int P_dump = std::min(P, OPT_P);
                 std::vector<float> h_features((size_t)OPT_P * MAX_PTS * C_IN, 0.0f);
                 std::vector<float> h_mask((size_t)OPT_P * MAX_PTS, 0.0f);
-                std::vector<int> h_coords((size_t)OPT_P * 4, 0);
+                std::vector<int>   h_coords((size_t)OPT_P * 4, 0);
                 std::memcpy(h_features.data(), batch.features.data(),
                             (size_t)P_dump * MAX_PTS * C_IN * sizeof(float));
                 std::memcpy(h_mask.data(), batch.mask.data(),
@@ -316,52 +351,88 @@ int main(int argc, char** argv) {
                 writeCalibBin(fn, h_coords.data(), h_coords.size() * sizeof(int));
             }
 
-            if (timer) timer->begin("h2d_coords");
-            cudaMemcpy(d_coords, batch.coords.data(), P * 4 * sizeof(int),
-                       cudaMemcpyHostToDevice);
-            if (timer) timer->end("h2d_coords");
+            // 4a CPU 路径：coords 单独 H2D 到 standalone d_coords（scatter kernel 读这里）
+            // 4b CPU 路径：coords H2D 由下面 e2e_ctx->setInput 完成
+            if (mode == M4A) {
+                if (timer) timer->begin("h2d_coords");
+                cudaMemcpy(d_coords, batch.coords.data(), P * 4 * sizeof(int),
+                           cudaMemcpyHostToDevice);
+                if (timer) timer->end("h2d_coords");
+            }
+        }
 
+        // ── 推理（mode-specific） ────────────────────────────────────────────
+        InferContext* outputs_ctx = nullptr;
+        if (mode == M4A) {
             if (timer) timer->begin("pfn");
-            pfn_ctx.setInputShape("pillar_features", {P, MAX_PTS, C_IN});
-            pfn_ctx.setInputShape("pillar_mask",     {P, MAX_PTS});
-            pfn_ctx.setInput("pillar_features",
-                             batch.features.data(), P * MAX_PTS * C_IN * sizeof(float));
-            pfn_ctx.setInput("pillar_mask",
-                             batch.mask.data(),     P * MAX_PTS * sizeof(float));
-            pfn_ctx.infer();
+            pfn_ctx->setInputShape("pillar_features", {P, MAX_PTS, C_IN});
+            pfn_ctx->setInputShape("pillar_mask",     {P, MAX_PTS});
+            if (!cuda_pillarize) {
+                pfn_ctx->setInput("pillar_features",
+                                  batch.features.data(), P * MAX_PTS * C_IN * sizeof(float));
+                pfn_ctx->setInput("pillar_mask",
+                                  batch.mask.data(),     P * MAX_PTS * sizeof(float));
+            }
+            // CUDA pillarize 路径：device buffer 已被 launchPillarizeCuda 填好，跳过 setInput
+            pfn_ctx->infer();
             if (timer) timer->end("pfn");
+
+            if (timer) timer->begin("scatter");
+            float* d_canvas = static_cast<float*>(bb_ctx->getDeviceBuffer("spatial_features"));
+            cudaMemset(d_canvas, 0, C_OUT * BEV_H * BEV_W * sizeof(float));
+            const float* d_emb = static_cast<const float*>(
+                pfn_ctx->getDeviceBuffer("pillar_embeddings"));
+            launchPillarScatter(d_emb, d_coords, d_canvas, P, C_OUT, BEV_H, BEV_W, stream);
+            cudaStreamSynchronize(stream);
+            if (timer) timer->end("scatter");
+
+            // 4a-only: dump backbone 输入（散射后 BEV，[1,64,512,512]），用于 backbone+head INT8 校准
+            if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
+                std::vector<float> h_canvas((size_t)C_OUT * BEV_H * BEV_W);
+                cudaMemcpy(h_canvas.data(), d_canvas,
+                           h_canvas.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                char fn[256];
+                snprintf(fn, sizeof(fn), "%s/frame_%03d_spatial_features.bin",
+                         dump_calib_dir.c_str(), dump_calib_count);
+                writeCalibBin(fn, h_canvas.data(), h_canvas.size() * sizeof(float));
+            }
+
+            if (timer) timer->begin("backbone");
+            bb_ctx->infer();
+            if (timer) timer->end("backbone");
+
+            outputs_ctx = bb_ctx.get();
+        } else {  // M4B
+            e2e_ctx->setInputShape("pillar_features", {P, MAX_PTS, C_IN});
+            e2e_ctx->setInputShape("pillar_mask",     {P, MAX_PTS});
+            e2e_ctx->setInputShape("pillar_coords",   {P, 4});
+            if (!cuda_pillarize) {
+                e2e_ctx->setInput("pillar_features",
+                                  batch.features.data(), P * MAX_PTS * C_IN * sizeof(float));
+                e2e_ctx->setInput("pillar_mask",
+                                  batch.mask.data(),     P * MAX_PTS * sizeof(float));
+                e2e_ctx->setInput("pillar_coords",
+                                  batch.coords.data(),   P * 4 * sizeof(int));
+            }
+            // CUDA pillarize 路径：三路 device buffer 已被 launchPillarizeCuda 填好
+
+            if (timer) timer->begin("infer_e2e");
+            e2e_ctx->infer();
+            if (timer) timer->end("infer_e2e");
+            outputs_ctx = e2e_ctx.get();
         }
 
-        if (timer) timer->begin("scatter");
-        float* d_canvas = static_cast<float*>(bb_ctx.getDeviceBuffer("spatial_features"));
-        cudaMemset(d_canvas, 0, C_OUT * BEV_H * BEV_W * sizeof(float));
-        const float* d_emb = static_cast<const float*>(
-            pfn_ctx.getDeviceBuffer("pillar_embeddings"));
-        launchPillarScatter(d_emb, d_coords, d_canvas, P, C_OUT, BEV_H, BEV_W, stream);
-        cudaStreamSynchronize(stream);
-        if (timer) timer->end("scatter");
-
-        // dump Backbone 输入（散射后 BEV，静态 [1,64,512,512]）；与本帧 PFN dump 配对
+        // 一帧的所有 binding dump 完成后再 +1（4a 含 spatial_features，4b 只有三路）
         if (!dump_calib_dir.empty() && dump_calib_count < dump_calib_frames) {
-            std::vector<float> h_canvas((size_t)C_OUT * BEV_H * BEV_W);
-            cudaMemcpy(h_canvas.data(), d_canvas,
-                       h_canvas.size() * sizeof(float), cudaMemcpyDeviceToHost);
-            char fn[256];
-            snprintf(fn, sizeof(fn), "%s/frame_%03d_spatial_features.bin",
-                     dump_calib_dir.c_str(), dump_calib_count);
-            writeCalibBin(fn, h_canvas.data(), h_canvas.size() * sizeof(float));
-            dump_calib_count++;  // 一帧的 3 个 binding 全部 dump 完后再 +1
+            dump_calib_count++;
         }
 
-        if (timer) timer->begin("backbone");
-        bb_ctx.infer();
-        if (timer) timer->end("backbone");
-
+        // ── Postprocess（mode 无关，从 outputs_ctx 读 head 输出） ────────────
         if (timer) timer->begin("decode_nms");
         std::vector<Detection> all_dets;
 
         if (cuda_postprocess) {
-            // GPU 路径：直接读 backbone engine 的 device output buffer，
+            // GPU 路径：直接读 head engine 的 device output buffer，
             // 避免 6 task × 6 tensor × 16K float 的 D2H（~1.5 MB → 几百 Detection）
             cudaMemsetAsync(d_cand_count, 0,
                             sizeof(unsigned int) * 6, stream);
@@ -370,21 +441,21 @@ int main(int argc, char** argv) {
             for (int t = 0; t < 6; t++) {
                 std::string pre = "task" + std::to_string(t) + "_";
                 int nc = TASK_NUM_CLS[t];
-                auto hm_shape = bb_ctx.getOutputShape(pre + "hm");
+                auto hm_shape = outputs_ctx->getOutputShape(pre + "hm");
                 int H = hm_shape[2], W = hm_shape[3];
 
                 const float* d_hm = static_cast<const float*>(
-                    bb_ctx.getDeviceBuffer(pre + "hm"));
+                    outputs_ctx->getDeviceBuffer(pre + "hm"));
                 const float* d_center = static_cast<const float*>(
-                    bb_ctx.getDeviceBuffer(pre + "center"));
+                    outputs_ctx->getDeviceBuffer(pre + "center"));
                 const float* d_center_z = static_cast<const float*>(
-                    bb_ctx.getDeviceBuffer(pre + "center_z"));
+                    outputs_ctx->getDeviceBuffer(pre + "center_z"));
                 const float* d_dim = static_cast<const float*>(
-                    bb_ctx.getDeviceBuffer(pre + "dim"));
+                    outputs_ctx->getDeviceBuffer(pre + "dim"));
                 const float* d_rot = static_cast<const float*>(
-                    bb_ctx.getDeviceBuffer(pre + "rot"));
+                    outputs_ctx->getDeviceBuffer(pre + "rot"));
                 const float* d_vel = static_cast<const float*>(
-                    bb_ctx.getDeviceBuffer(pre + "vel"));
+                    outputs_ctx->getDeviceBuffer(pre + "vel"));
 
                 launchDecodeTaskCuda(
                     d_hm, d_center, d_center_z, d_dim, d_rot, d_vel,
@@ -426,19 +497,19 @@ int main(int argc, char** argv) {
                 std::string pre = "task" + std::to_string(t) + "_";
                 int nc = TASK_NUM_CLS[t];
 
-                auto hm_shape = bb_ctx.getOutputShape(pre + "hm");
+                auto hm_shape = outputs_ctx->getOutputShape(pre + "hm");
                 int H = hm_shape[2], W = hm_shape[3];
                 size_t map = (size_t)(H * W) * sizeof(float);
 
                 std::vector<float> hm(nc*H*W), center(2*H*W), center_z(H*W);
                 std::vector<float> dim(3*H*W), rot(2*H*W), vel(2*H*W);
 
-                bb_ctx.getOutput(pre+"hm",       hm.data(),       nc*map);
-                bb_ctx.getOutput(pre+"center",   center.data(),    2*map);
-                bb_ctx.getOutput(pre+"center_z", center_z.data(),  map);
-                bb_ctx.getOutput(pre+"dim",      dim.data(),       3*map);
-                bb_ctx.getOutput(pre+"rot",      rot.data(),       2*map);
-                bb_ctx.getOutput(pre+"vel",      vel.data(),       2*map);
+                outputs_ctx->getOutput(pre+"hm",       hm.data(),       nc*map);
+                outputs_ctx->getOutput(pre+"center",   center.data(),    2*map);
+                outputs_ctx->getOutput(pre+"center_z", center_z.data(),  map);
+                outputs_ctx->getOutput(pre+"dim",      dim.data(),       3*map);
+                outputs_ctx->getOutput(pre+"rot",      rot.data(),       2*map);
+                outputs_ctx->getOutput(pre+"vel",      vel.data(),       2*map);
 
                 auto dets = decodeTask(
                     hm.data(), center.data(), center_z.data(),
@@ -594,7 +665,7 @@ int main(int argc, char** argv) {
                   << " frames to " << dump_calib_dir << "\n";
     }
 
-    cudaFree(d_coords);
+    if (mode == M4A && d_coords) cudaFree(d_coords);
     if (cuda_pillarize) {
         if (d_points) cudaFree(d_points);
         cudaFree(d_voxel_point_count);
