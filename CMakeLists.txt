@@ -55,7 +55,7 @@ add_executable(test_postprocess
 )
 target_link_libraries(test_postprocess cudart)
 
-# Plugin 静态库：由 build_engine / infer_pipeline_4b / 单测共享链接
+# Plugin 静态库：由 build_engine / infer_pipeline (4b mode) / 单测共享链接
 add_library(centerpoint_plugin STATIC
     plugin/scatter_plugin.cpp
     cuda/scatter_kernel.cu
@@ -69,30 +69,19 @@ target_link_libraries(test_scatter_plugin
     centerpoint_plugin nvinfer nvinfer_plugin cudart
 )
 
+# 统一 pipeline：通过 --mode {4a,4b} 切换
+#   4a：pfn + 显式 scatter + backbone+head（scatter_kernel.cu 直接编进 binary）
+#   4b：单一 e2e engine（scatter 在图内，由 centerpoint_plugin 提供 IPluginV3）
 add_executable(infer_pipeline
     pipeline/infer_pipeline.cpp
     src/infer_context.cpp
     src/pillarize.cpp
     src/postprocess.cpp
     src/bench.cpp
-    cuda/scatter_kernel.cu
     cuda/pillarize_kernel.cu
     cuda/postprocess_kernel.cu
 )
+# scatter_kernel.cu 由 centerpoint_plugin 提供，避免多定义
 target_link_libraries(infer_pipeline
-    nvinfer nvinfer_plugin cudart
-)
-
-# 4b 端到端 pipeline：单引擎含 PillarScatter plugin
-add_executable(infer_pipeline_4b
-    pipeline/infer_pipeline_4b.cpp
-    src/infer_context.cpp
-    src/pillarize.cpp
-    src/postprocess.cpp
-    src/bench.cpp
-    cuda/pillarize_kernel.cu
-    cuda/postprocess_kernel.cu
-)
-target_link_libraries(infer_pipeline_4b
     centerpoint_plugin nvinfer nvinfer_plugin cudart
 )
