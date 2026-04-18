@@ -27,6 +27,13 @@
 #include <iomanip>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <stdexcept>
+#include <chrono>
+#include <nvtx3/nvToolsExt.h>
+
 
 static constexpr float X_MIN = -51.2f, X_MAX = 51.2f;
 static constexpr float Y_MIN = -51.2f, Y_MAX = 51.2f;
@@ -109,6 +116,573 @@ static void writeFrameJson(std::ostream& os,
 
 enum Mode { M4A, M4B };
 
+struct DoubleBufferSlot {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t done = nullptr;
+    cudaEvent_t frame_start = nullptr;
+    cudaEvent_t frame_stop = nullptr;
+    cudaEvent_t h2d_start = nullptr;
+    cudaEvent_t h2d_stop = nullptr;
+    cudaEvent_t pillarize_stop = nullptr;
+    cudaEvent_t infer_start = nullptr;
+    cudaEvent_t infer_stop = nullptr;
+    cudaEvent_t decode_start = nullptr;
+    cudaEvent_t decode_stop = nullptr;
+
+    bool in_flight = false;
+    bool measured = false;
+    int frame_index = -1;
+    std::string key;
+
+    float* h_points_pinned = nullptr;
+    size_t h_points_cap = 0;
+    float* d_points = nullptr;
+    int d_points_capacity = 0;
+
+    unsigned int* d_voxel_point_count = nullptr;
+    float* d_voxels_dense = nullptr;
+    float* d_voxel_features_compact = nullptr;
+    unsigned int* d_voxel_num_points = nullptr;
+    unsigned int* d_pillar_num = nullptr;
+    unsigned int* h_pillar_num = nullptr;
+
+    Detection* d_cand_buffer = nullptr;
+    unsigned int* d_cand_count = nullptr;
+    Detection* h_cand_buffer_pinned = nullptr;
+    unsigned int* h_cand_count_pinned = nullptr;
+
+    std::unique_ptr<InferContext> e2e_ctx;
+};
+
+static void initDoubleBufferSlot(DoubleBufferSlot& slot,
+                                 const InferEngine& shared_engine) {
+    cudaStreamCreateWithFlags(&slot.stream, cudaStreamNonBlocking);
+    cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming);
+    cudaEventCreate(&slot.frame_start);
+    cudaEventCreate(&slot.frame_stop);
+    cudaEventCreate(&slot.h2d_start);
+    cudaEventCreate(&slot.h2d_stop);
+    cudaEventCreate(&slot.pillarize_stop);
+    cudaEventCreate(&slot.infer_start);
+    cudaEventCreate(&slot.infer_stop);
+    cudaEventCreate(&slot.decode_start);
+    cudaEventCreate(&slot.decode_stop);
+
+    slot.e2e_ctx = std::make_unique<InferContext>(shared_engine);
+    slot.e2e_ctx->setStream(slot.stream);
+
+    PillarizeWorkspaceBytes wb;
+    pillarizeCudaWorkspaceBytes(BEV_H, BEV_W, MAX_PTS, MAX_PILLARS, wb);
+    cudaMalloc(&slot.d_voxel_point_count,      wb.voxel_point_count_bytes);
+    cudaMalloc(&slot.d_voxels_dense,           wb.voxels_dense_bytes);
+    cudaMalloc(&slot.d_voxel_features_compact, wb.voxel_features_bytes);
+    cudaMalloc(&slot.d_voxel_num_points,       wb.voxel_num_points_bytes);
+    cudaMalloc(&slot.d_pillar_num,             wb.pillar_num_bytes);
+    cudaHostAlloc(&slot.h_pillar_num, sizeof(unsigned int), cudaHostAllocDefault);
+
+    PostprocessWorkspaceBytes pwb;
+    postprocessCudaWorkspaceBytes(6, MAX_CANDS_PER_TASK, pwb);
+    cudaMalloc(&slot.d_cand_buffer, pwb.cand_buffer_bytes);
+    cudaMalloc(&slot.d_cand_count,  pwb.cand_count_bytes);
+    cudaHostAlloc(&slot.h_cand_buffer_pinned, pwb.cand_buffer_bytes, cudaHostAllocDefault);
+    cudaHostAlloc(&slot.h_cand_count_pinned,  pwb.cand_count_bytes,  cudaHostAllocDefault);
+}
+
+static void destroyDoubleBufferSlot(DoubleBufferSlot& slot) {
+    if (slot.in_flight) cudaEventSynchronize(slot.done);
+    slot.e2e_ctx.reset();
+
+    if (slot.d_points) cudaFree(slot.d_points);
+    if (slot.h_points_pinned) cudaFreeHost(slot.h_points_pinned);
+
+    if (slot.d_voxel_point_count) cudaFree(slot.d_voxel_point_count);
+    if (slot.d_voxels_dense) cudaFree(slot.d_voxels_dense);
+    if (slot.d_voxel_features_compact) cudaFree(slot.d_voxel_features_compact);
+    if (slot.d_voxel_num_points) cudaFree(slot.d_voxel_num_points);
+    if (slot.d_pillar_num) cudaFree(slot.d_pillar_num);
+    if (slot.h_pillar_num) cudaFreeHost(slot.h_pillar_num);
+
+    if (slot.d_cand_buffer) cudaFree(slot.d_cand_buffer);
+    if (slot.d_cand_count) cudaFree(slot.d_cand_count);
+    if (slot.h_cand_buffer_pinned) cudaFreeHost(slot.h_cand_buffer_pinned);
+    if (slot.h_cand_count_pinned) cudaFreeHost(slot.h_cand_count_pinned);
+
+    if (slot.frame_start) cudaEventDestroy(slot.frame_start);
+    if (slot.frame_stop) cudaEventDestroy(slot.frame_stop);
+    if (slot.h2d_start) cudaEventDestroy(slot.h2d_start);
+    if (slot.h2d_stop) cudaEventDestroy(slot.h2d_stop);
+    if (slot.pillarize_stop) cudaEventDestroy(slot.pillarize_stop);
+    if (slot.infer_start) cudaEventDestroy(slot.infer_start);
+    if (slot.infer_stop) cudaEventDestroy(slot.infer_stop);
+    if (slot.decode_start) cudaEventDestroy(slot.decode_start);
+    if (slot.decode_stop) cudaEventDestroy(slot.decode_stop);
+    if (slot.done) cudaEventDestroy(slot.done);
+    if (slot.stream) cudaStreamDestroy(slot.stream);
+}
+
+static void ensureDoubleBufferDevicePoints(DoubleBufferSlot& slot, int N) {
+    if (N <= slot.d_points_capacity) return;
+    if (slot.d_points) cudaFree(slot.d_points);
+    slot.d_points_capacity = N + (N >> 2);
+    cudaMalloc(&slot.d_points, (size_t)slot.d_points_capacity * 5 * sizeof(float));
+}
+
+static void submitDoubleBufferFrame(DoubleBufferSlot& slot,
+                                    const float* pts_ptr,
+                                    int N,
+                                    int frame_index,
+                                    const std::string& key,
+                                    bool measured) {
+    slot.frame_index = frame_index;
+    slot.key = key;
+    slot.measured = measured;
+
+    ensureDoubleBufferDevicePoints(slot, N);
+
+    float* tgt_features = static_cast<float*>(
+        slot.e2e_ctx->getDeviceBuffer("pillar_features"));
+    float* tgt_mask = static_cast<float*>(
+        slot.e2e_ctx->getDeviceBuffer("pillar_mask"));
+    int* tgt_coords = static_cast<int*>(
+        slot.e2e_ctx->getDeviceBuffer("pillar_coords"));
+
+    nvtxRangePushA("submit_frame");
+
+    if (measured) {
+        cudaEventRecord(slot.frame_start, slot.stream);
+        cudaEventRecord(slot.h2d_start, slot.stream);
+    }
+
+    nvtxRangePushA("h2d");
+    cudaMemcpyAsync(slot.d_points, pts_ptr, (size_t)N * 5 * sizeof(float),
+                    cudaMemcpyHostToDevice, slot.stream);
+    if (measured) cudaEventRecord(slot.h2d_stop, slot.stream);
+    nvtxRangePop();
+
+    nvtxRangePushA("pillarize");
+    launchPillarizeCuda(
+        slot.d_points, N,
+        X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX,
+        VX, VY, VZ, BEV_H, BEV_W, MAX_PTS, MAX_PILLARS,
+        slot.d_voxel_point_count, slot.d_voxels_dense, slot.d_voxel_features_compact,
+        slot.d_voxel_num_points, slot.d_pillar_num,
+        tgt_features, tgt_mask, tgt_coords,
+        slot.h_pillar_num, slot.stream);
+    if (measured) cudaEventRecord(slot.pillarize_stop, slot.stream);
+    nvtxRangePop();
+
+    // Dynamic shape 仍需 CPU 读 P；同步范围只覆盖 H2D + pillarize。
+    nvtxRangePushA("sync_for_P");
+    cudaStreamSynchronize(slot.stream);
+    int P = static_cast<int>(*slot.h_pillar_num);
+    if (P > MAX_PILLARS) P = MAX_PILLARS;
+    nvtxRangePop();
+
+    slot.e2e_ctx->setInputShape("pillar_features", {P, MAX_PTS, C_IN});
+    slot.e2e_ctx->setInputShape("pillar_mask",     {P, MAX_PTS});
+    slot.e2e_ctx->setInputShape("pillar_coords",   {P, 4});
+
+    nvtxRangePushA("infer");
+    if (measured) cudaEventRecord(slot.infer_start, slot.stream);
+    slot.e2e_ctx->inferAsync();
+    if (measured) cudaEventRecord(slot.infer_stop, slot.stream);
+    nvtxRangePop();
+
+    nvtxRangePushA("decode");
+    if (measured) cudaEventRecord(slot.decode_start, slot.stream);
+    cudaMemsetAsync(slot.d_cand_count, 0, sizeof(unsigned int) * 6, slot.stream);
+    int cls_offset_gpu = 0;
+    for (int t = 0; t < 6; t++) {
+        std::string pre = "task" + std::to_string(t) + "_";
+        int nc = TASK_NUM_CLS[t];
+        auto hm_shape = slot.e2e_ctx->getOutputShape(pre + "hm");
+        int H = hm_shape[2], W = hm_shape[3];
+
+        const float* d_hm = static_cast<const float*>(
+            slot.e2e_ctx->getDeviceBuffer(pre + "hm"));
+        const float* d_center = static_cast<const float*>(
+            slot.e2e_ctx->getDeviceBuffer(pre + "center"));
+        const float* d_center_z = static_cast<const float*>(
+            slot.e2e_ctx->getDeviceBuffer(pre + "center_z"));
+        const float* d_dim = static_cast<const float*>(
+            slot.e2e_ctx->getDeviceBuffer(pre + "dim"));
+        const float* d_rot = static_cast<const float*>(
+            slot.e2e_ctx->getDeviceBuffer(pre + "rot"));
+        const float* d_vel = static_cast<const float*>(
+            slot.e2e_ctx->getDeviceBuffer(pre + "vel"));
+
+        launchDecodeTaskCuda(
+            d_hm, d_center, d_center_z, d_dim, d_rot, d_vel,
+            H, W, nc, t, cls_offset_gpu, MAX_CANDS_PER_TASK,
+            SCORE_THRESH, X_MIN, Y_MIN, VX, VY, OUT_STRIDE,
+            slot.d_cand_buffer + (size_t)t * MAX_CANDS_PER_TASK,
+            slot.d_cand_count + t,
+            slot.stream);
+        cls_offset_gpu += nc;
+    }
+
+    cudaMemcpyAsync(slot.h_cand_count_pinned, slot.d_cand_count,
+                    sizeof(unsigned int) * 6,
+                    cudaMemcpyDeviceToHost, slot.stream);
+    cudaMemcpyAsync(slot.h_cand_buffer_pinned, slot.d_cand_buffer,
+                    sizeof(Detection) * 6 * MAX_CANDS_PER_TASK,
+                    cudaMemcpyDeviceToHost, slot.stream);
+
+    if (measured) {
+        cudaEventRecord(slot.decode_stop, slot.stream);
+    }
+    cudaEventRecord(slot.done, slot.stream);
+    nvtxRangePop();   // decode
+    nvtxRangePop();   // submit_frame
+    slot.in_flight = true;
+}
+
+struct DoubleBufferSamples {
+    std::vector<float> h2d_points;
+    std::vector<float> pillarize;
+    std::vector<float> infer_e2e;
+    std::vector<float> decode_nms;
+    std::vector<float> end_to_end;
+    int submitted_frames = 0;
+    int collected_frames = 0;
+};
+
+static float elapsedMs(cudaEvent_t start, cudaEvent_t stop) {
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    return ms;
+}
+
+static std::vector<Detection> collectDoubleBufferFrame(DoubleBufferSlot& slot,
+                                                       DoubleBufferSamples* samples) {
+    cudaEventSynchronize(slot.done);
+
+    const bool record_samples = samples && slot.measured;
+    float h2d_ms = 0.0f;
+    float pillarize_ms = 0.0f;
+    float infer_ms = 0.0f;
+    float decode_gpu_ms = 0.0f;
+    float e2e_ms = 0.0f;
+    if (record_samples) {
+        h2d_ms = elapsedMs(slot.h2d_start, slot.h2d_stop);
+        pillarize_ms = elapsedMs(slot.h2d_stop, slot.pillarize_stop);
+        infer_ms = elapsedMs(slot.infer_start, slot.infer_stop);
+        decode_gpu_ms = elapsedMs(slot.decode_start, slot.decode_stop);
+    }
+
+    auto nms_start = std::chrono::steady_clock::now();
+
+    std::vector<Detection> all_dets;
+    for (int t = 0; t < 6; t++) {
+        unsigned int K = slot.h_cand_count_pinned[t];
+        if (K > (unsigned int)MAX_CANDS_PER_TASK) {
+            std::cerr << "[warn] task " << t << " candidate overflow: "
+                      << K << " > " << MAX_CANDS_PER_TASK
+                      << "（候选被截断；考虑调大 MAX_CANDS_PER_TASK）\n";
+            K = MAX_CANDS_PER_TASK;
+        }
+        std::vector<Detection> dets(
+            slot.h_cand_buffer_pinned + (size_t)t * MAX_CANDS_PER_TASK,
+            slot.h_cand_buffer_pinned + (size_t)t * MAX_CANDS_PER_TASK + K);
+        dets = circleNMS(dets, TASK_NMS_RADIUS[t]);
+        all_dets.insert(all_dets.end(), dets.begin(), dets.end());
+    }
+    auto nms_stop = std::chrono::steady_clock::now();
+
+    if (record_samples) {
+        float nms_ms = std::chrono::duration<float, std::milli>(
+            nms_stop - nms_start).count();
+        cudaEventRecord(slot.frame_stop, slot.stream);
+        cudaEventSynchronize(slot.frame_stop);
+        e2e_ms = elapsedMs(slot.frame_start, slot.frame_stop);
+        samples->h2d_points.push_back(h2d_ms);
+        samples->pillarize.push_back(pillarize_ms);
+        samples->infer_e2e.push_back(infer_ms);
+        samples->decode_nms.push_back(decode_gpu_ms + nms_ms);
+        samples->end_to_end.push_back(e2e_ms);
+        samples->collected_frames++;
+    }
+
+    slot.in_flight = false;
+    slot.measured = false;
+    return all_dets;
+}
+
+struct DoubleBufferStats {
+    float mean = 0.0f;
+    float median = 0.0f;
+    float p99 = 0.0f;
+    float vmin = 0.0f;
+    float vmax = 0.0f;
+};
+
+static DoubleBufferStats computeDoubleBufferStats(std::vector<float> samples) {
+    DoubleBufferStats s;
+    if (samples.empty()) return s;
+    std::sort(samples.begin(), samples.end());
+    s.vmin = samples.front();
+    s.vmax = samples.back();
+    s.median = samples[samples.size() / 2];
+    size_t p99i = static_cast<size_t>(std::min<float>(
+        samples.size() - 1, std::floor(samples.size() * 0.99f)));
+    s.p99 = samples[p99i];
+    s.mean = std::accumulate(samples.begin(), samples.end(), 0.0f) / samples.size();
+    return s;
+}
+
+static void printDoubleBufferSummary(const DoubleBufferSamples& samples,
+                                     float wall_ms) {
+    if (samples.end_to_end.empty()) {
+        std::cout << "DoubleBuffer benchmark: no samples\n";
+        return;
+    }
+    auto e2e = computeDoubleBufferStats(samples.end_to_end);
+    float latency_fps = e2e.median > 0.0f ? 1000.0f / e2e.median : 0.0f;
+    float throughput_fps = wall_ms > 0.0f
+        ? (samples.collected_frames * 1000.0f / wall_ms)
+        : 0.0f;
+
+    std::cout << "\n=== Benchmark (iters=" << samples.collected_frames
+              << ", 4b double-buffer, stream cudaEvent + wall clock) ===\n";
+    std::cout << std::left << std::setw(18) << "Stage"
+              << std::right
+              << std::setw(9) << "mean"
+              << std::setw(9) << "median"
+              << std::setw(9) << "min"
+              << std::setw(9) << "max"
+              << std::setw(9) << "p99"
+              << std::setw(9) << "share"
+              << "\n";
+    std::cout << std::string(72, '-') << "\n";
+    std::cout << std::fixed << std::setprecision(3);
+
+    auto print_row = [&](const std::string& name, const std::vector<float>& values) {
+        auto st = computeDoubleBufferStats(values);
+        float share = e2e.median > 0.0f ? (st.median / e2e.median * 100.0f) : 0.0f;
+        std::cout << std::left << std::setw(18) << name
+                  << std::right
+                  << std::setw(9) << st.mean
+                  << std::setw(9) << st.median
+                  << std::setw(9) << st.vmin
+                  << std::setw(9) << st.vmax
+                  << std::setw(9) << st.p99
+                  << std::setw(8) << std::setprecision(1) << share << "%"
+                  << std::setprecision(3)
+                  << "\n";
+    };
+
+    print_row("h2d_points", samples.h2d_points);
+    print_row("pillarize", samples.pillarize);
+    print_row("infer_e2e", samples.infer_e2e);
+    print_row("decode_nms", samples.decode_nms);
+    std::cout << std::string(72, '-') << "\n";
+    print_row("end_to_end", samples.end_to_end);
+    std::cout << std::fixed << std::setprecision(3)
+              << "\nsubmitted_frames: " << samples.submitted_frames
+              << "  collected_frames: " << samples.collected_frames << "\n"
+              << "wall_time_ms: " << wall_ms << "\n"
+              << std::setprecision(1)
+              << "Throughput FPS (collected / wall_time): " << throughput_fps << " fps\n"
+              << "Latency FPS (1000 / median end_to_end): " << latency_fps
+              << " fps  (latency median " << std::setprecision(2)
+              << e2e.median << " ms)\n";
+}
+
+static void writeDoubleBufferJson(const std::string& path,
+                                  const DoubleBufferSamples& samples,
+                                  float wall_ms) {
+    std::ofstream f(path);
+    if (!f) throw std::runtime_error("无法写入 bench JSON: " + path);
+
+    auto e2e = computeDoubleBufferStats(samples.end_to_end);
+    auto h2d = computeDoubleBufferStats(samples.h2d_points);
+    auto pillarize = computeDoubleBufferStats(samples.pillarize);
+    auto infer = computeDoubleBufferStats(samples.infer_e2e);
+    auto decode = computeDoubleBufferStats(samples.decode_nms);
+    float latency_fps = e2e.median > 0.0f ? 1000.0f / e2e.median : 0.0f;
+    float throughput_fps = wall_ms > 0.0f
+        ? (samples.collected_frames * 1000.0f / wall_ms)
+        : 0.0f;
+
+    auto write_stats = [&](const DoubleBufferStats& st) {
+        f << "{\"mean\": " << st.mean
+          << ", \"median\": " << st.median
+          << ", \"min\": " << st.vmin
+          << ", \"max\": " << st.vmax
+          << ", \"p99\": " << st.p99 << "}";
+    };
+
+    f << "{\n";
+    f << "  \"buffering\": \"double\",\n";
+    f << "  \"mode\": \"4b\",\n";
+    f << "  \"frames_in_flight\": 2,\n";
+    f << "  \"iters\": " << samples.collected_frames << ",\n";
+    f << "  \"submitted_frames\": " << samples.submitted_frames << ",\n";
+    f << "  \"collected_frames\": " << samples.collected_frames << ",\n";
+    f << std::fixed << std::setprecision(4);
+    f << "  \"wall_time_ms\": " << wall_ms << ",\n";
+    f << "  \"throughput_fps\": " << throughput_fps << ",\n";
+    f << "  \"latency_fps_median\": " << latency_fps << ",\n";
+    f << "  \"stages\": {\n";
+    f << "    \"h2d_points\": "; write_stats(h2d); f << ",\n";
+    f << "    \"pillarize\": "; write_stats(pillarize); f << ",\n";
+    f << "    \"infer_e2e\": "; write_stats(infer); f << ",\n";
+    f << "    \"decode_nms\": "; write_stats(decode); f << ",\n";
+    f << "    \"end_to_end\": "; write_stats(e2e); f << "\n";
+    f << "  }\n";
+    f << "}\n";
+}
+
+static int runDoubleBuffer4b(const std::string& e2e_engine_path,
+                             const std::vector<std::string>& bin_files,
+                             bool benchmark,
+                             int warmup_iters,
+                             int bench_iters,
+                             const std::string& bench_output,
+                             const std::string& json_path) {
+    std::cerr << "[pipeline] mode=4b double-buffer  pillarize=CUDA postprocess=CUDA pinned-points=on\n";
+    centerpoint_trt::registerPillarScatterPlugin();
+
+    // engine 加载一次，两个 slot 各持自己的 IExecutionContext + buffers
+    InferEngine shared_engine(e2e_engine_path);
+
+    DoubleBufferSlot slots[2];
+    initDoubleBufferSlot(slots[0], shared_engine);
+    initDoubleBufferSlot(slots[1], shared_engine);
+
+    auto collectIfNeeded = [&](DoubleBufferSlot& slot,
+                               DoubleBufferSamples* samples) -> std::vector<Detection> {
+        if (!slot.in_flight) return {};
+        return collectDoubleBufferFrame(slot, samples);
+    };
+
+    if (benchmark) {
+        std::cerr << "[benchmark] preloading " << bin_files.size()
+                  << " bin files into pinned memory (excluded from timing)...\n";
+        std::vector<float*> preloaded_pinned;
+        std::vector<int> preloaded_N;
+        preloaded_pinned.reserve(bin_files.size());
+        preloaded_N.reserve(bin_files.size());
+
+        size_t total_pinned_bytes = 0;
+        for (const auto& p : bin_files) {
+            float* buf = nullptr;
+            size_t cap = 0;
+            int N = loadBinIntoPinned(p, buf, cap);
+            preloaded_pinned.push_back(buf);
+            preloaded_N.push_back(N);
+            total_pinned_bytes += cap;
+        }
+        std::cerr << "[benchmark] preloaded pinned host "
+                  << total_pinned_bytes / (1024*1024) << " MB\n";
+        std::cerr << "[benchmark] warmup=" << warmup_iters
+                  << "  iters=" << bench_iters << "\n";
+
+        int n_files = (int)preloaded_N.size();
+        for (int i = 0; i < warmup_iters; i++) {
+            DoubleBufferSlot& slot = slots[i % 2];
+            collectIfNeeded(slot, nullptr);
+            int idx = i % n_files;
+            submitDoubleBufferFrame(slot, preloaded_pinned[idx], preloaded_N[idx],
+                                    i, bin_files[idx], false);
+        }
+        collectIfNeeded(slots[0], nullptr);
+        collectIfNeeded(slots[1], nullptr);
+
+        DoubleBufferSamples samples;
+        samples.h2d_points.reserve(bench_iters);
+        samples.pillarize.reserve(bench_iters);
+        samples.infer_e2e.reserve(bench_iters);
+        samples.decode_nms.reserve(bench_iters);
+        samples.end_to_end.reserve(bench_iters);
+        nvtxRangePushA("bench_window");
+        auto bench_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < bench_iters; i++) {
+            DoubleBufferSlot& slot = slots[i % 2];
+            collectIfNeeded(slot, &samples);
+            int idx = i % n_files;
+            submitDoubleBufferFrame(slot, preloaded_pinned[idx], preloaded_N[idx],
+                                    i, bin_files[idx], true);
+            samples.submitted_frames++;
+        }
+        collectIfNeeded(slots[0], &samples);
+        collectIfNeeded(slots[1], &samples);
+        auto bench_stop = std::chrono::steady_clock::now();
+        nvtxRangePop();   // bench_window
+        float wall_ms = std::chrono::duration<float, std::milli>(
+            bench_stop - bench_start).count();
+
+        printDoubleBufferSummary(samples, wall_ms);
+        if (!bench_output.empty()) {
+            writeDoubleBufferJson(bench_output, samples, wall_ms);
+            std::cerr << "[benchmark] wrote " << bench_output << "\n";
+        }
+
+        for (auto* p : preloaded_pinned) cudaFreeHost(p);
+    } else {
+        std::ofstream jf;
+        if (!json_path.empty()) {
+            jf.open(json_path);
+            jf << "{\n";
+        }
+
+        auto emit = [&](int frame_index,
+                        const std::string& key,
+                        const std::vector<Detection>& dets) {
+            int total = (int)bin_files.size();
+            if (!json_path.empty()) {
+                writeFrameJson(jf, key, dets);
+                if (frame_index + 1 < total) jf << ",";
+                jf << "\n";
+            } else {
+                std::cout << "\n[" << (frame_index + 1) << "/" << total << "] "
+                          << key << "  dets=" << dets.size() << "\n";
+                for (const auto& d : dets) {
+                    printf("  %-25s score=%.3f  xyz=(%.1f,%.1f,%.1f)  wlh=(%.1f,%.1f,%.1f)  rot=%.2f\n",
+                           CLASS_NAMES[d.cls_id], d.score,
+                           d.x, d.y, d.z, d.w, d.l, d.h, d.rot);
+                }
+            }
+        };
+
+        int total = (int)bin_files.size();
+        for (int fi = 0; fi < total; fi++) {
+            DoubleBufferSlot& slot = slots[fi % 2];
+            if (slot.in_flight) {
+                int done_index = slot.frame_index;
+                std::string done_key = slot.key;
+                auto dets = collectDoubleBufferFrame(slot, nullptr);
+                emit(done_index, done_key, dets);
+            }
+
+            int N = loadBinIntoPinned(bin_files[fi],
+                                      slot.h_points_pinned,
+                                      slot.h_points_cap);
+            submitDoubleBufferFrame(slot, slot.h_points_pinned, N,
+                                    fi, bin_files[fi], false);
+        }
+
+        int start = std::max(0, total - 2);
+        for (int fi = start; fi < total; fi++) {
+            DoubleBufferSlot& slot = slots[fi % 2];
+            if (!slot.in_flight) continue;
+            int done_index = slot.frame_index;
+            std::string done_key = slot.key;
+            auto dets = collectDoubleBufferFrame(slot, nullptr);
+            emit(done_index, done_key, dets);
+        }
+
+        if (!json_path.empty()) {
+            jf << "}\n";
+            std::cerr << "JSON written to " << json_path << "\n";
+        }
+    }
+
+    destroyDoubleBufferSlot(slots[0]);
+    destroyDoubleBufferSlot(slots[1]);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     Mode mode = M4A;
     std::string pfn_engine_path = "/workspace/engines/pfn_fp16.plan";
@@ -125,6 +699,7 @@ int main(int argc, char** argv) {
     bool cuda_pillarize = false;
     bool cuda_postprocess = false;
     bool pinned_points = false;
+    bool double_buffer = false;
     std::string dump_calib_dir;
     int dump_calib_frames = 0;
 
@@ -148,6 +723,7 @@ int main(int argc, char** argv) {
         else if (arg == "--cuda-pillarize")   cuda_pillarize = true;
         else if (arg == "--cuda-postprocess") cuda_postprocess = true;
         else if (arg == "--pinned-points")    pinned_points = true;
+        else if (arg == "--double-buffer")    double_buffer = true;
         else if (arg == "--dump-calib-dir" && i + 1 < argc) dump_calib_dir = argv[++i];
         else if (arg == "--calib-frames"   && i + 1 < argc) dump_calib_frames = std::stoi(argv[++i]);
         else bin_files.push_back(arg);
@@ -168,7 +744,7 @@ int main(int argc, char** argv) {
                   << "                       [--pfn-engine PATH] [--bb-engine PATH]    (4a)\n"
                   << "                       [--e2e-engine PATH]                       (4b)\n"
                   << "                       [--json out.json]\n"
-                  << "                       [--cuda-pillarize] [--cuda-postprocess] [--pinned-points]\n"
+                  << "                       [--cuda-pillarize] [--cuda-postprocess] [--pinned-points] [--double-buffer]\n"
                   << "                       [--benchmark [--warmup N] [--bench-iters N] [--bench-output bench.json]]\n"
                   << "                       [--dump-calib-dir <dir> [--calib-frames N]]\n";
         return 1;
@@ -176,16 +752,37 @@ int main(int argc, char** argv) {
     if (!dump_calib_dir.empty() && dump_calib_frames <= 0) dump_calib_frames = 32;
     int dump_calib_count = 0;
 
+    if (double_buffer) {
+        if (mode != M4B) {
+            std::cerr << "--double-buffer 当前只支持 --mode 4b 端到端 engine\n";
+            return 1;
+        }
+        if (!cuda_pillarize || !cuda_postprocess || !pinned_points) {
+            std::cerr << "--double-buffer requires --cuda-pillarize --cuda-postprocess --pinned-points\n";
+            return 1;
+        }
+        if (!dump_calib_dir.empty()) {
+            std::cerr << "--double-buffer 当前不支持 --dump-calib-dir；请用单 buffer 路径 dump 校准输入\n";
+            return 1;
+        }
+        return runDoubleBuffer4b(e2e_engine_path, bin_files, benchmark,
+                                 warmup_iters, bench_iters, bench_output, json_path);
+    }
+
     std::cerr << "[pipeline] mode=" << (mode == M4A ? "4a" : "4b") << "\n";
 
     // ── Engine 加载 ─────────────────────────────────────────────────────────
+    std::unique_ptr<InferEngine> pfn_engine, bb_engine, e2e_engine;
     std::unique_ptr<InferContext> pfn_ctx, bb_ctx, e2e_ctx;
     if (mode == M4A) {
-        pfn_ctx = std::make_unique<InferContext>(pfn_engine_path);
-        bb_ctx  = std::make_unique<InferContext>(bb_engine_path);
+        pfn_engine = std::make_unique<InferEngine>(pfn_engine_path);
+        bb_engine  = std::make_unique<InferEngine>(bb_engine_path);
+        pfn_ctx = std::make_unique<InferContext>(*pfn_engine);
+        bb_ctx  = std::make_unique<InferContext>(*bb_engine);
     } else {
         centerpoint_trt::registerPillarScatterPlugin();
-        e2e_ctx = std::make_unique<InferContext>(e2e_engine_path);
+        e2e_engine = std::make_unique<InferEngine>(e2e_engine_path);
+        e2e_ctx = std::make_unique<InferContext>(*e2e_engine);
     }
 
     // 4a 独立 d_coords：scatter kernel 从这里读 pillar→cell 的索引

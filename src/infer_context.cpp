@@ -4,9 +4,9 @@
 #include <stdexcept>
 #include <iostream>
 
-// ── 工具：vector<int> → nvinfer1::Dims ───────────────────────────────────────
+// ── 工具：vector<int> ↔ nvinfer1::Dims ───────────────────────────────────────
 
-static nvinfer1::Dims toDims(const std::vector<int>& v) 
+static nvinfer1::Dims toDims(const std::vector<int>& v)
 {
     nvinfer1::Dims d;
     d.nbDims = static_cast<int>(v.size());
@@ -14,52 +14,61 @@ static nvinfer1::Dims toDims(const std::vector<int>& v)
     return d;
 }
 
-static std::vector<int> fromDims(const nvinfer1::Dims& d) 
+static std::vector<int> fromDims(const nvinfer1::Dims& d)
 {
     std::vector<int> v(d.nbDims);
     for (int i = 0; i < d.nbDims; ++i) v[i] = d.d[i];
     return v;
 }
 
-static size_t dimsVolume(const nvinfer1::Dims& d) 
+static size_t dimsVolume(const nvinfer1::Dims& d)
 {
     size_t vol = 1;
     for (int i = 0; i < d.nbDims; ++i) vol *= d.d[i];
     return vol;
 }
 
-// ── 构造：加载 engine ─────────────────────────────────────────────────────────
+// ── InferEngine：runtime + ICudaEngine 共享层 ─────────────────────────────────
 
-InferContext::InferContext(const std::string& engine_path) 
+InferEngine::InferEngine(const std::string& engine_path)
 {
-    // 读取 .plan 文件
     std::ifstream f(engine_path, std::ios::binary);
-
     if (!f) throw std::runtime_error("无法打开 engine: " + engine_path);
 
     std::vector<char> buf(std::istreambuf_iterator<char>(f), {});
 
-    // 反序列化
     runtime_.reset(nvinfer1::createInferRuntime(logger_));
     engine_.reset(runtime_->deserializeCudaEngine(buf.data(), buf.size()));
 
     if (!engine_) throw std::runtime_error("engine 反序列化失败");
 
-    context_.reset(engine_->createExecutionContext());
-
-    if (!context_) throw std::runtime_error("ExecutionContext 创建失败");
-
-    cudaStreamCreate(&stream_);
-    allocateBuffers();
-
     std::cout << "engine 加载完成: " << engine_path
               << "（" << engine_->getNbIOTensors() << " 个 IO tensors）\n";
 }
 
-InferContext::~InferContext() 
+InferEngine::~InferEngine() = default;
+
+int InferEngine::getNbIOTensors() const
+{
+    return engine_->getNbIOTensors();
+}
+
+// ── InferContext：由外部 InferEngine 构造 ────────────────────────────────────
+
+InferContext::InferContext(const InferEngine& engine)
+    : engine_(engine.engine())
+{
+    context_.reset(engine_->createExecutionContext());
+    if (!context_) throw std::runtime_error("ExecutionContext 创建失败");
+
+    cudaStreamCreate(&stream_);
+    allocateBuffers();
+}
+
+InferContext::~InferContext()
 {
     for (auto& [name, ptr] : buffers_) cudaFree(ptr);
-    cudaStreamDestroy(stream_);
+    if (owns_stream_) cudaStreamDestroy(stream_);
 }
 
 // ── allocateBuffers：按 max shape 预分配 GPU 内存 ─────────────────────────────
@@ -98,36 +107,66 @@ void InferContext::allocateBuffers() {
 // ── setInputShape：动态输入设实际形状 ────────────────────────────────────────
 
 void InferContext::setInputShape(const std::string& name,
-                                  const std::vector<int>& shape) 
-                                  {
+                                  const std::vector<int>& shape)
+{
     context_->setInputShape(name.c_str(), toDims(shape));
 }
 
 // ── setInput：CPU → GPU ───────────────────────────────────────────────────────
 
 void InferContext::setInput(const std::string& name,
-                             const void* data, size_t bytes) 
-                             {
+                             const void* data, size_t bytes)
+{
+    setInputAsync(name, data, bytes);
+}
+
+void InferContext::setInputAsync(const std::string& name,
+                                 const void* data, size_t bytes)
+{
     cudaMemcpyAsync(buffers_.at(name), data, bytes,
                     cudaMemcpyHostToDevice, stream_);
 }
 
 // ── infer ─────────────────────────────────────────────────────────────────────
 
-void InferContext::infer() 
+void InferContext::infer()
+{
+    inferAsync();
+    cudaStreamSynchronize(stream_);
+}
+
+void InferContext::inferAsync()
 {
     context_->enqueueV3(stream_);
-    cudaStreamSynchronize(stream_);
 }
 
 // ── getOutput：GPU → CPU ──────────────────────────────────────────────────────
 
 void InferContext::getOutput(const std::string& name,
-                              void* data, size_t bytes) 
-                              {
+                              void* data, size_t bytes)
+{
+    getOutputAsync(name, data, bytes);
+    cudaStreamSynchronize(stream_);
+}
+
+void InferContext::getOutputAsync(const std::string& name,
+                                  void* data, size_t bytes)
+{
     cudaMemcpyAsync(data, buffers_.at(name), bytes,
                     cudaMemcpyDeviceToHost, stream_);
-    cudaStreamSynchronize(stream_);
+}
+
+void InferContext::setStream(cudaStream_t stream)
+{
+    if (stream_ == stream) return;
+    if (owns_stream_) cudaStreamDestroy(stream_);
+    stream_ = stream;
+    owns_stream_ = false;
+}
+
+cudaStream_t InferContext::stream() const
+{
+    return stream_;
 }
 
 // ── getOutputShape ────────────────────────────────────────────────────────────

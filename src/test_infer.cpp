@@ -6,7 +6,8 @@
 int main() {
     // ── 测试 backbone_head（静态输入）──────────────────────────────────────────
     {
-        InferContext ctx("/workspace/engines/backbone_head_fp16.plan");
+        InferEngine eng("/workspace/engines/backbone_head_fp16.plan");
+        InferContext ctx(eng);
 
         // dummy input：全零，shape [1, 64, 512, 512]
         std::vector<float> input(1 * 64 * 512 * 512, 0.0f);
@@ -32,7 +33,8 @@ int main() {
     // ── 测试 PFN（动态输入）───────────────────────────────────────────────────
     {
         int P = 12000, N = 20, C = 11;
-        InferContext ctx("/workspace/engines/pfn_fp16.plan");
+        InferEngine eng("/workspace/engines/pfn_fp16.plan");
+        InferContext ctx(eng);
 
         ctx.setInputShape("pillar_features", {P, N, C});
         ctx.setInputShape("pillar_mask",     {P, N});
