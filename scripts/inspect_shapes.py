@@ -1,24 +1,31 @@
 """
 模型结构插桩：打印每个关键模块的输入输出 tensor shape。
-在宿主机 openpcdet conda 环境下运行，不进容器。
+在能 import pcdet 的 Python 环境下运行（OpenPCDet 仓库通过 --openpcdet-root 注入）。
 
 用法：
-  cd /home/uceeanz/OpenPCDet/tools
-  python ../../TensorRT/scripts/inspect_shapes.py
+  python scripts/inspect_shapes.py \
+      --openpcdet-root ~/OpenPCDet \
+      --cfg  ~/OpenPCDet/tools/cfgs/nuscenes_models/centerpoint_pillar_nuscenes.yaml \
+      --ckpt ~/OpenPCDet/ckpts/centerpoint_pillar_nuscenes.pth \
+      --data-root /data/sidney/datasets/nuscenes
 """
 
+import argparse
 import sys
-import torch
-import numpy as np
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'OpenPCDet'))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'OpenPCDet' / 'tools'))
+import numpy as np
+import torch
 
-from pcdet.config import cfg, cfg_from_yaml_file
-from pcdet.datasets import NuScenesDataset
-from pcdet.models import build_network, load_data_to_gpu
-from pcdet.utils import common_utils
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--openpcdet-root", type=Path, default=None)
+    ap.add_argument("--cfg", type=Path, required=True)
+    ap.add_argument("--ckpt", type=Path, required=True)
+    ap.add_argument("--data-root", type=Path, required=True)
+    ap.add_argument("--data-version", default="v1.0-mini")
+    return ap.parse_args()
 
 
 # ── 工具函数 ──────────────────────────────────────────────
@@ -80,25 +87,32 @@ def remove_hooks():
 
 # ── 主流程 ────────────────────────────────────────────────
 def main():
-    cfg_file = '/home/uceeanz/OpenPCDet/tools/cfgs/nuscenes_models/centerpoint_pillar_nuscenes.yaml'
-    ckpt    = '/home/uceeanz/OpenPCDet/ckpts/centerpoint_pillar_nuscenes.pth'
-    data_root = Path('/home/uceeanz/OpenPCDet/data/nuscenes')
+    args = parse_args()
+
+    if args.openpcdet_root:
+        sys.path.insert(0, str(args.openpcdet_root))
+        sys.path.insert(0, str(args.openpcdet_root / "tools"))
+
+    from pcdet.config import cfg, cfg_from_yaml_file
+    from pcdet.datasets import NuScenesDataset
+    from pcdet.models import build_network, load_data_to_gpu
+    from pcdet.utils import common_utils
 
     logger = common_utils.create_logger()
-    cfg_from_yaml_file(cfg_file, cfg)
-    cfg.DATA_CONFIG.VERSION = 'v1.0-mini'
+    cfg_from_yaml_file(str(args.cfg), cfg)
+    cfg.DATA_CONFIG.VERSION = args.data_version
 
     dataset = NuScenesDataset(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
-        root_path=data_root,
+        root_path=args.data_root,
         training=False,
         logger=logger,
     )
     print(f"\n数据集大小: {len(dataset)} 帧")
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=dataset)
-    model.load_params_from_file(filename=ckpt, logger=logger, to_cpu=True)
+    model.load_params_from_file(filename=str(args.ckpt), logger=logger, to_cpu=True)
     model.cuda()
     model.eval()
 

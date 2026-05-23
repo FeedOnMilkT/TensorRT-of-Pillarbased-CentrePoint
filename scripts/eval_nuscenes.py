@@ -5,15 +5,14 @@ nuScenes mAP/NDS 评测脚本（脱离 OpenPCDet）。
 读取 C++ pipeline 输出的 raw_dets.json（LiDAR frame 检测框），
 做 LiDAR → ego → global 坐标变换，调用官方 nuscenes-devkit 评测。
 
-依赖：nuscenes-devkit、pyquaternion、numpy（容器内 /workspace/deps）。
+依赖：nuscenes-devkit、pyquaternion、numpy（直接安装到容器自带 python，参见 CLAUDE.md）。
 
 用法（容器内）：
-  export PYTHONPATH=/workspace/deps:$PYTHONPATH
   python scripts/eval_nuscenes.py \
       --results-json results/raw_dets.json \
-      --data-root /data/nuscenes/v1.0-mini \
-      --version v1.0-mini \
-      --split mini_val \
+      --data-root /data/sidney/datasets/nuscenes \
+      --version v1.0-trainval \
+      --split val \
       --output-dir results/eval_devkit
 """
 

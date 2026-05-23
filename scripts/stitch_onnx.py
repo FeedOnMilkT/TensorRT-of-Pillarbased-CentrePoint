@@ -13,7 +13,10 @@
   outputs: 36 个 head tensors
 
 用法（容器内）：
-  PYTHONPATH=/workspace/deps python3 scripts/stitch_onnx.py
+  python3 scripts/stitch_onnx.py \
+      --pfn $CENTERPOINT_ROOT/onnx/pfn.onnx \
+      --backbone $CENTERPOINT_ROOT/onnx/backbone_head.onnx \
+      --out $CENTERPOINT_ROOT/onnx/centerpoint_e2e.onnx
 """
 
 import argparse

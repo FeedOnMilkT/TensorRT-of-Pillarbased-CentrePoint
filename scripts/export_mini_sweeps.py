@@ -4,11 +4,15 @@ Export nuScenes mini_val LiDAR frames (current + 9 sweeps aggregated) for TRT in
 
 Standalone: depends only on nuscenes-devkit, pyquaternion, numpy. No OpenPCDet import.
 
-Run:
-  /home/uceeanz/.conda/envs/openpcdet/bin/python TensorRT/scripts/export_mini_sweeps.py
+Run (容器内，参数化路径)：
+  python scripts/export_mini_sweeps.py \
+      --data-root /data/sidney/datasets/nuscenes \
+      --version v1.0-mini --split val \
+      --out-dir   /data/sidney/datasets/nuscenes_sweeps_cache/mini_val \
+      --list-path /data/sidney/datasets/nuscenes_sweeps_cache/mini_val/files.txt
 
 Then inside the TensorRT container:
-  build/infer_pipeline --file-list results/mini_sweeps/files.txt --json results/raw_dets.json
+  build/infer_pipeline --file-list <out-dir>/files.txt --json results/raw_dets.json
 
 The output bin layout matches OpenPCDet's NuScenesDataset.get_lidar_with_sweeps with
 MAX_SWEEPS=10: each .bin is float32 [N, 5] where columns are (x, y, z, intensity, time_lag).
@@ -39,7 +43,7 @@ def parse_args():
     )
     parser.add_argument(
         "--data-root",
-        default="/home/uceeanz/OpenPCDet/data/nuscenes",
+        default="/data/sidney/datasets/nuscenes",
         help="nuScenes data root (contains the version subdirectory).",
     )
     parser.add_argument(
@@ -56,7 +60,7 @@ def parse_args():
     )
     parser.add_argument(
         "--out-dir",
-        default="/home/uceeanz/TensorRT/results/mini_sweeps",
+        default="/data/sidney/datasets/nuscenes_sweeps_cache/mini_val",
         help="Output directory. Aggregated bins live under OUT_DIR/samples/LIDAR_TOP/.",
     )
     parser.add_argument(

@@ -1,49 +1,60 @@
 """
 统计多帧推理中 pillar 数量 P 的分布，用于确定 TRT Optimization Profile 的 min/opt/max。
 
-用法：
-  cd /home/uceeanz/OpenPCDet/tools
-  python ../../TensorRT/scripts/profile_pillar_count.py --frames 20
+用法（在能 import pcdet 的 Python 环境内）：
+  python scripts/profile_pillar_count.py \
+      --openpcdet-root ~/OpenPCDet \
+      --cfg  ~/OpenPCDet/tools/cfgs/nuscenes_models/centerpoint_pillar_nuscenes.yaml \
+      --ckpt ~/OpenPCDet/ckpts/centerpoint_pillar_nuscenes.pth \
+      --data-root /data/sidney/datasets/nuscenes \
+      --frames 20
 """
 
-import sys
 import argparse
-import torch
-import numpy as np
+import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'OpenPCDet'))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'OpenPCDet' / 'tools'))
+import numpy as np
+import torch
 
-from pcdet.config import cfg, cfg_from_yaml_file
-from pcdet.datasets import NuScenesDataset
-from pcdet.models import build_network, load_data_to_gpu
-from pcdet.utils import common_utils
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--openpcdet-root", type=Path, default=None)
+    ap.add_argument("--cfg", type=Path, required=True)
+    ap.add_argument("--ckpt", type=Path, required=True)
+    ap.add_argument("--data-root", type=Path, required=True)
+    ap.add_argument("--data-version", default="v1.0-mini")
+    ap.add_argument('--frames', type=int, default=20, help='统计帧数')
+    return ap.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--frames', type=int, default=20, help='统计帧数')
-    args = parser.parse_args()
+    args = parse_args()
 
-    cfg_file = '/home/uceeanz/OpenPCDet/tools/cfgs/nuscenes_models/centerpoint_pillar_nuscenes.yaml'
-    ckpt     = '/home/uceeanz/OpenPCDet/ckpts/centerpoint_pillar_nuscenes.pth'
-    data_root = Path('/home/uceeanz/OpenPCDet/data/nuscenes')
+    if args.openpcdet_root:
+        sys.path.insert(0, str(args.openpcdet_root))
+        sys.path.insert(0, str(args.openpcdet_root / "tools"))
+
+    from pcdet.config import cfg, cfg_from_yaml_file
+    from pcdet.datasets import NuScenesDataset
+    from pcdet.models import build_network, load_data_to_gpu
+    from pcdet.utils import common_utils
 
     logger = common_utils.create_logger()
-    cfg_from_yaml_file(cfg_file, cfg)
-    cfg.DATA_CONFIG.VERSION = 'v1.0-mini'
+    cfg_from_yaml_file(str(args.cfg), cfg)
+    cfg.DATA_CONFIG.VERSION = args.data_version
 
     dataset = NuScenesDataset(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
-        root_path=data_root,
+        root_path=args.data_root,
         training=False,
         logger=logger,
     )
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=dataset)
-    model.load_params_from_file(filename=ckpt, logger=logger, to_cpu=True)
+    model.load_params_from_file(filename=str(args.ckpt), logger=logger, to_cpu=True)
     model.cuda()
     model.eval()
 

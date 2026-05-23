@@ -1,6 +1,7 @@
 #include "engine_builder.h"
 #include "scatter_plugin.h"
 #include "calibrator.h"
+#include "project_paths.h"
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -11,6 +12,9 @@
 //   --int8-pfn <calib_dir>：仅构建 PFN INT8，从 calib_dir 读 dump 数据
 //   --int8-bb  <calib_dir>：仅构建 backbone+head INT8
 //   --int8-e2e <calib_dir>：仅构建 e2e INT8，从 calib_dir 读三路 dump 数据
+//
+// 路径解析：onnx / engines / calib cache 路径由 project_paths.h 统一从
+// $CENTERPOINT_ROOT（或可执行文件上溯）派生，不再硬编码 /workspace/...。
 int main(int argc, char* argv[])
 {
     centerpoint_trt::registerPillarScatterPlugin();
@@ -41,10 +45,10 @@ int main(int argc, char* argv[])
             {"pillar_mask",     "pillar_mask",     MASK_BYTES},
         };
         CenterPointCalibrator calib(ins, int8_pfn_dir, n,
-                                    "/workspace/engines/calib_pfn.cache");
+                                    centerpoint_trt::enginePath("calib_pfn.cache"));
         bool ok = buildEngine(
-            "/workspace/onnx/pfn.onnx",
-            "/workspace/engines/pfn_int8.plan",
+            centerpoint_trt::onnxPath("pfn.onnx"),
+            centerpoint_trt::enginePath("pfn_int8.plan"),
             /*fp16=*/false,  // INT8 模式下 buildEngine 内部会同时打开 FP16 fallback
             /*workspace_gb=*/2,
             {
@@ -65,10 +69,10 @@ int main(int argc, char* argv[])
             {"spatial_features", "spatial_features", BB_BYTES},
         };
         CenterPointCalibrator calib(ins, int8_bb_dir, n,
-                                    "/workspace/engines/calib_bb.cache");
+                                    centerpoint_trt::enginePath("calib_bb.cache"));
         bool ok = buildEngine(
-            "/workspace/onnx/backbone_head.onnx",
-            "/workspace/engines/backbone_head_int8.plan",
+            centerpoint_trt::onnxPath("backbone_head.onnx"),
+            centerpoint_trt::enginePath("backbone_head_int8.plan"),
             /*fp16=*/false,
             /*workspace_gb=*/2,
             /*profiles=*/{},
@@ -90,10 +94,10 @@ int main(int argc, char* argv[])
             {"pillar_coords",   "pillar_coords",   COORD_BYTES},
         };
         CenterPointCalibrator calib(ins, int8_e2e_dir, n,
-                                    "/workspace/engines/calib_e2e.cache");
+                                    centerpoint_trt::enginePath("calib_e2e.cache"));
         bool ok = buildEngine(
-            "/workspace/onnx/centerpoint_e2e.onnx",
-            "/workspace/engines/centerpoint_e2e_int8.plan",
+            centerpoint_trt::onnxPath("centerpoint_e2e.onnx"),
+            centerpoint_trt::enginePath("centerpoint_e2e_int8.plan"),
             /*fp16=*/false,
             /*workspace_gb=*/2,
             {
@@ -109,8 +113,8 @@ int main(int argc, char* argv[])
 
     // ── 默认 FP16 构建（无 INT8 标志时的原行为） ────────────────────────────
     bool ok = buildEngine(
-        "/workspace/onnx/backbone_head.onnx",
-        "/workspace/engines/backbone_head_fp16.plan",
+        centerpoint_trt::onnxPath("backbone_head.onnx"),
+        centerpoint_trt::enginePath("backbone_head_fp16.plan"),
         /*fp16=*/true,
         /*workspace_gb=*/2,
         /*profiles=*/{}
@@ -118,8 +122,8 @@ int main(int argc, char* argv[])
     if (!ok) { std::cerr << "backbone engine 构建失败\n"; return 1; }
 
     ok = buildEngine(
-        "/workspace/onnx/pfn.onnx",
-        "/workspace/engines/pfn_fp16.plan",
+        centerpoint_trt::onnxPath("pfn.onnx"),
+        centerpoint_trt::enginePath("pfn_fp16.plan"),
         /*fp16=*/true,
         /*workspace_gb=*/2,
         {
@@ -130,8 +134,8 @@ int main(int argc, char* argv[])
     if (!ok) { std::cerr << "PFN engine 构建失败\n"; return 1; }
 
     ok = buildEngine(
-        "/workspace/onnx/centerpoint_e2e.onnx",
-        "/workspace/engines/centerpoint_e2e_fp16.plan",
+        centerpoint_trt::onnxPath("centerpoint_e2e.onnx"),
+        centerpoint_trt::enginePath("centerpoint_e2e_fp16.plan"),
         /*fp16=*/true,
         /*workspace_gb=*/2,
         {

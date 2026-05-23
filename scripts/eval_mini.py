@@ -1,50 +1,71 @@
 #!/usr/bin/env python3
 """
-nuScenes mini_val 评测脚本。
+通过 OpenPCDet 的 NuScenesDataset.evaluation() 评测 mini_val 检测结果。
 
-用法：
-  cd /home/uceeanz/OpenPCDet/tools
-  python ../../TensorRT/scripts/eval_mini.py
+需要外部 OpenPCDet 仓库提供 pcdet 包；通过 --openpcdet-root 或 PYTHONPATH 注入。
+
+用法示例：
+  python scripts/eval_mini.py \
+      --openpcdet-root ~/OpenPCDet \
+      --cfg ~/OpenPCDet/tools/cfgs/nuscenes_models/centerpoint_pillar_nuscenes_mini.yaml \
+      --data-root /data/sidney/datasets/nuscenes \
+      --results-json results/raw_dets.json \
+      --output-dir   results/eval_output
 """
 
+import argparse
 import json
-import sys
-import os
 import logging
+import os
+import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "OpenPCDet"))
-
-from pcdet.datasets.nuscenes.nuscenes_dataset import NuScenesDataset
-from pcdet.config import cfg, cfg_from_yaml_file
 import numpy as np
 
-RAW_DET_JSON = "../../TensorRT/results/raw_dets.json"
-CFG_FILE     = "cfgs/nuscenes_models/centerpoint_pillar_nuscenes_mini.yaml"
-DATA_ROOT    = Path("../data/nuscenes")
-OUTPUT_DIR   = "../../TensorRT/results/eval_output"
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--openpcdet-root", type=Path, default=None,
+                    help="OpenPCDet 仓库根目录；不传则依赖 PYTHONPATH 已包含 pcdet。")
+    ap.add_argument("--cfg", type=Path, required=True,
+                    help="OpenPCDet 配置 yaml（如 cfgs/nuscenes_models/centerpoint_pillar_nuscenes_mini.yaml）")
+    ap.add_argument("--data-root", type=Path, required=True,
+                    help="nuScenes 根目录（含 samples/、sweeps/、v1.0-* 元数据）")
+    ap.add_argument("--results-json", type=Path, required=True,
+                    help="C++ pipeline 输出的 raw_dets.json")
+    ap.add_argument("--output-dir", type=Path, required=True,
+                    help="OpenPCDet evaluation() 中间产物目录")
+    return ap.parse_args()
+
 
 def main():
+    args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("eval_mini")
 
-    cfg_from_yaml_file(CFG_FILE, cfg)
+    if args.openpcdet_root:
+        sys.path.insert(0, str(args.openpcdet_root))
+
+    from pcdet.datasets.nuscenes.nuscenes_dataset import NuScenesDataset
+    from pcdet.config import cfg, cfg_from_yaml_file
+
+    cfg_from_yaml_file(str(args.cfg), cfg)
 
     dataset = NuScenesDataset(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
-        root_path=DATA_ROOT,
+        root_path=args.data_root,
         training=False,
         logger=logger,
     )
 
-    print(f"mini_val 帧数: {len(dataset)}")
+    print(f"评测帧数: {len(dataset)}")
 
-    with open(RAW_DET_JSON) as f:
+    with open(args.results_json) as f:
         raw = json.load(f)
 
-    # raw_dets.json key 是容器绝对路径（/data/nuscenes/v1.0-mini/samples/...）
-    # info['lidar_path'] 是相对路径（samples/...），以 samples/ 后缀对齐
+    # raw_dets.json key 可能是容器内绝对路径，info['lidar_path'] 是相对路径 (samples/...)。
+    # 提取 samples/ 后缀对齐。
     raw_by_rel = {}
     for k, v in raw.items():
         idx = k.find('samples/')
@@ -83,12 +104,12 @@ def main():
     matched = sum(1 for a in det_annos if len(a['name']) > 0)
     print(f"匹配到预测的帧数: {matched}/{len(det_annos)}")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    result_str, result_dict = dataset.evaluation(
+    os.makedirs(args.output_dir, exist_ok=True)
+    result_str, _ = dataset.evaluation(
         det_annos=det_annos,
         class_names=cfg.CLASS_NAMES,
         eval_metric='nuscenes',
-        output_path=os.path.join(OUTPUT_DIR, "trt_result"),
+        output_path=str(args.output_dir / "trt_result"),
     )
 
     print(result_str)

@@ -17,6 +17,7 @@
 #include "postprocess.h"
 #include "postprocess_cuda.h"
 #include "bench.h"
+#include "project_paths.h"
 #include <cuda_runtime.h>
 #include <fstream>
 #include <iostream>
@@ -685,9 +686,11 @@ static int runDoubleBuffer4b(const std::string& e2e_engine_path,
 
 int main(int argc, char** argv) {
     Mode mode = M4A;
-    std::string pfn_engine_path = "/workspace/engines/pfn_fp16.plan";
-    std::string bb_engine_path  = "/workspace/engines/backbone_head_fp16.plan";
-    std::string e2e_engine_path = "/workspace/engines/centerpoint_e2e_fp16.plan";
+    // 默认 engine 路径相对 $CENTERPOINT_ROOT/engines/ 解析（或可执行文件上溯）。
+    // CLI 的 --pfn-engine / --bb-engine / --e2e-engine 仍可覆盖。
+    std::string pfn_engine_path = centerpoint_trt::enginePath("pfn_fp16.plan");
+    std::string bb_engine_path  = centerpoint_trt::enginePath("backbone_head_fp16.plan");
+    std::string e2e_engine_path = centerpoint_trt::enginePath("centerpoint_e2e_fp16.plan");
     std::string json_path;
     std::string file_list_path;
     std::vector<std::string> bin_files;

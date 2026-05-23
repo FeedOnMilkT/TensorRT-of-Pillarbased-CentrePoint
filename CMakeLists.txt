@@ -2,9 +2,15 @@ cmake_minimum_required(VERSION 3.18)
 project(centerpoint_trt LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
+
+# CUDA arch 写死为 80（A100 SM_80）。
+# 切换硬件时显式覆盖：cmake -DCMAKE_CUDA_ARCHITECTURES=70（V100）/90（H100）。
+# 不做自动检测：项目目前只在 sidney-dev / Brev A100 上跑，写死 80 让生成的
+# fatbin 不携带多余 cubin，缩短链接体积，也避免 nvcc 报告含糊的"unsupported gpu arch"。
 set(CMAKE_CUDA_ARCHITECTURES 80)  # A100=80, V100=70, H100=90
 
-# TRT 头文件和库路径（容器内实际路径，标准系统位置）
+# TRT 头文件和库路径（sidney-dev 容器内 TRT 10.8 实测路径，标准系统位置）。
+# 路径外的安装位置请通过 -DTRT_INCLUDE_DIR=... -DTRT_LIB_DIR=... 覆盖。
 set(TRT_INCLUDE_DIR "/usr/include/x86_64-linux-gnu" CACHE PATH "TensorRT include dir")
 set(TRT_LIB_DIR     "/usr/lib/x86_64-linux-gnu"     CACHE PATH "TensorRT lib dir")
 find_package(CUDA REQUIRED)

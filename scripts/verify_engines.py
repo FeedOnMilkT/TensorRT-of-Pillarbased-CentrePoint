@@ -1,18 +1,41 @@
 """
 验证 TRT engine 输出与 ONNX (onnxruntime) 数值一致。
-在容器内运行：
-  cd /workspace
-  PYTHONPATH=/workspace/deps python scripts/verify_engines.py
+
+容器内运行（依赖容器自带 tensorrt / onnxruntime / pycuda；不再依赖外部 deps 目录）：
+  python scripts/verify_engines.py \
+      --onnx-dir   $CENTERPOINT_ROOT/onnx \
+      --engine-dir $CENTERPOINT_ROOT/engines
+
+默认值从环境变量 CENTERPOINT_ROOT / CENTERPOINT_ONNX_DIR / CENTERPOINT_ENGINE_DIR 解析，
+对应 C++ 侧 include/project_paths.h 的约定。
 """
 
+import argparse
+import os
 import sys
-sys.path.insert(0, '/workspace/deps')
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
 import tensorrt as trt
 import pycuda.driver as cuda
-import pycuda.autoinit
+import pycuda.autoinit  # noqa: F401
+
+
+def project_root() -> Path:
+    env = os.environ.get("CENTERPOINT_ROOT")
+    if env:
+        return Path(env)
+    # scripts/verify_engines.py → 项目根
+    return Path(__file__).resolve().parents[1]
+
+
+def default_onnx_dir() -> Path:
+    return Path(os.environ.get("CENTERPOINT_ONNX_DIR", project_root() / "onnx"))
+
+
+def default_engine_dir() -> Path:
+    return Path(os.environ.get("CENTERPOINT_ENGINE_DIR", project_root() / "engines"))
 
 
 # ── TRT 工具 ──────────────────────────────────────────────────────────────────
@@ -60,19 +83,19 @@ class TRTInfer:
 
 # ── 验证 backbone_head ────────────────────────────────────────────────────────
 
-def verify_backbone():
+def verify_backbone(onnx_dir: Path, engine_dir: Path):
     print("=" * 60)
     print("验证 backbone_head")
 
     dummy = np.random.randn(1, 64, 512, 512).astype(np.float32)
 
     # onnxruntime
-    sess = ort.InferenceSession('/workspace/onnx/backbone_head.onnx',
+    sess = ort.InferenceSession(str(onnx_dir / 'backbone_head.onnx'),
                                 providers=['CPUExecutionProvider'])
     ort_out = sess.run(None, {'spatial_features': dummy})
 
     # TRT
-    trt_infer = TRTInfer('/workspace/engines/backbone_head_fp16.plan')
+    trt_infer = TRTInfer(str(engine_dir / 'backbone_head_fp16.plan'))
     trt_out = trt_infer.infer({'spatial_features': dummy})
 
     # FP32(onnxruntime) vs FP16(TRT)，atol=0.1 是合理上界
@@ -94,7 +117,7 @@ def verify_backbone():
 
 # ── 验证 PFN ─────────────────────────────────────────────────────────────────
 
-def verify_pfn():
+def verify_pfn(onnx_dir: Path, engine_dir: Path):
     print("=" * 60)
     print("验证 PFN")
 
@@ -103,7 +126,7 @@ def verify_pfn():
     dummy_mask  = np.ones((P, 20), dtype=np.float32)
 
     # onnxruntime
-    sess = ort.InferenceSession('/workspace/onnx/pfn.onnx',
+    sess = ort.InferenceSession(str(onnx_dir / 'pfn.onnx'),
                                 providers=['CPUExecutionProvider'])
     ort_out = sess.run(None, {
         'pillar_features': dummy_feats,
@@ -111,7 +134,7 @@ def verify_pfn():
     })[0]
 
     # TRT
-    trt_infer = TRTInfer('/workspace/engines/pfn_fp16.plan')
+    trt_infer = TRTInfer(str(engine_dir / 'pfn_fp16.plan'))
     trt_out = trt_infer.infer({
         'pillar_features': dummy_feats,
         'pillar_mask': dummy_mask,
@@ -125,8 +148,20 @@ def verify_pfn():
     return close
 
 
-if __name__ == '__main__':
-    ok1 = verify_backbone()
-    ok2 = verify_pfn()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--onnx-dir", type=Path, default=default_onnx_dir(),
+                    help="ONNX 目录（默认 $CENTERPOINT_ONNX_DIR 或 $CENTERPOINT_ROOT/onnx）")
+    ap.add_argument("--engine-dir", type=Path, default=default_engine_dir(),
+                    help="Engine 目录（默认 $CENTERPOINT_ENGINE_DIR 或 $CENTERPOINT_ROOT/engines）")
+    args = ap.parse_args()
+
+    ok1 = verify_backbone(args.onnx_dir, args.engine_dir)
+    ok2 = verify_pfn(args.onnx_dir, args.engine_dir)
     print("\n" + "=" * 60)
     print(f"总体结果：{'全部通过' if ok1 and ok2 else '存在差异，需要排查'}")
+    sys.exit(0 if (ok1 and ok2) else 1)
+
+
+if __name__ == '__main__':
+    main()

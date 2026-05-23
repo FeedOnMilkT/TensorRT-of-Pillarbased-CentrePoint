@@ -1,12 +1,15 @@
 #include "infer_context.h"
+#include "project_paths.h"
 #include <iostream>
 #include <vector>
 #include <numeric>
 
 int main() {
+    // engine 路径由 project_paths.h 解析（$CENTERPOINT_ENGINE_DIR 或 $CENTERPOINT_ROOT/engines）。
+
     // ── 测试 backbone_head（静态输入）──────────────────────────────────────────
     {
-        InferEngine eng("/workspace/engines/backbone_head_fp16.plan");
+        InferEngine eng(centerpoint_trt::enginePath("backbone_head_fp16.plan"));
         InferContext ctx(eng);
 
         // dummy input：全零，shape [1, 64, 512, 512]
@@ -33,7 +36,7 @@ int main() {
     // ── 测试 PFN（动态输入）───────────────────────────────────────────────────
     {
         int P = 12000, N = 20, C = 11;
-        InferEngine eng("/workspace/engines/pfn_fp16.plan");
+        InferEngine eng(centerpoint_trt::enginePath("pfn_fp16.plan"));
         InferContext ctx(eng);
 
         ctx.setInputShape("pillar_features", {P, N, C});

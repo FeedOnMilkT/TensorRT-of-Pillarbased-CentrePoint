@@ -6,23 +6,45 @@ DynPillarVFE 内部有 scatter_max（不可导出），这里用 padding + max-p
   - 输出：pillar 特征 [P, C_out=64]
 权重与预训练 checkpoint 完全兼容，仅聚合方式从 scatter 换成 masked max-pool。
 
-用法：
-  cd /home/uceeanz/OpenPCDet/tools
-  python ../../TensorRT/scripts/export_pfn.py
+用法（在能 import pcdet 的 Python 环境内）：
+  python scripts/export_pfn.py \
+      --openpcdet-root ~/OpenPCDet \
+      --cfg  ~/OpenPCDet/tools/cfgs/nuscenes_models/centerpoint_pillar_nuscenes.yaml \
+      --ckpt ~/OpenPCDet/ckpts/centerpoint_pillar_nuscenes.pth \
+      --data-root /data/sidney/datasets/nuscenes \
+      --out $CENTERPOINT_ROOT/onnx/pfn.onnx
 """
 
+import argparse
+import os
 import sys
-import torch
-import torch.nn as nn
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'OpenPCDet'))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'OpenPCDet' / 'tools'))
+import torch
+import torch.nn as nn
 
-from pcdet.config import cfg, cfg_from_yaml_file
-from pcdet.datasets import NuScenesDataset
-from pcdet.models import build_network
-from pcdet.utils import common_utils
+
+def project_root() -> Path:
+    env = os.environ.get("CENTERPOINT_ROOT")
+    return Path(env) if env else Path(__file__).resolve().parents[1]
+
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--openpcdet-root", type=Path, default=None,
+                    help="OpenPCDet 仓库根目录；不传则依赖 PYTHONPATH 已含 pcdet。")
+    ap.add_argument("--cfg", type=Path, required=True,
+                    help="OpenPCDet cfg yaml (centerpoint_pillar_nuscenes.yaml)")
+    ap.add_argument("--ckpt", type=Path, required=True,
+                    help="预训练权重 .pth")
+    ap.add_argument("--data-root", type=Path, required=True,
+                    help="nuScenes 根目录（仅用于实例化 NuScenesDataset，构图不依赖数据内容）")
+    ap.add_argument("--out", type=Path,
+                    default=project_root() / "onnx" / "pfn.onnx",
+                    help="输出 ONNX 路径，默认 $CENTERPOINT_ROOT/onnx/pfn.onnx")
+    ap.add_argument("--data-version", default="v1.0-mini",
+                    help="cfg.DATA_CONFIG.VERSION 覆盖值")
+    return ap.parse_args()
 
 
 class PFNExportWrapper(nn.Module):
@@ -71,21 +93,27 @@ class PFNExportWrapper(nn.Module):
 
 
 def main():
-    cfg_file  = '/home/uceeanz/OpenPCDet/tools/cfgs/nuscenes_models/centerpoint_pillar_nuscenes.yaml'
-    ckpt      = '/home/uceeanz/OpenPCDet/ckpts/centerpoint_pillar_nuscenes.pth'
-    out_path  = '/home/uceeanz/TensorRT/onnx/pfn.onnx'
-    data_root = Path('/home/uceeanz/OpenPCDet/data/nuscenes')
+    args = parse_args()
+
+    if args.openpcdet_root:
+        sys.path.insert(0, str(args.openpcdet_root))
+        sys.path.insert(0, str(args.openpcdet_root / "tools"))
+
+    from pcdet.config import cfg, cfg_from_yaml_file
+    from pcdet.datasets import NuScenesDataset
+    from pcdet.models import build_network
+    from pcdet.utils import common_utils
 
     logger = common_utils.create_logger()
-    cfg_from_yaml_file(cfg_file, cfg)
-    cfg.DATA_CONFIG.VERSION = 'v1.0-mini'
+    cfg_from_yaml_file(str(args.cfg), cfg)
+    cfg.DATA_CONFIG.VERSION = args.data_version
 
     dataset = NuScenesDataset(
         dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES,
-        root_path=data_root, training=False, logger=logger,
+        root_path=args.data_root, training=False, logger=logger,
     )
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=dataset)
-    model.load_params_from_file(filename=ckpt, logger=logger, to_cpu=True)
+    model.load_params_from_file(filename=str(args.ckpt), logger=logger, to_cpu=True)
     model.cuda().eval()
 
     wrapper = PFNExportWrapper(model.vfe.pfn_layers).cuda().eval()
@@ -95,11 +123,12 @@ def main():
     dummy_feats = torch.zeros(P, max_pts, C_in, device='cuda')
     dummy_mask  = torch.ones(P, max_pts, device='cuda')
 
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
             (dummy_feats, dummy_mask),
-            out_path,
+            str(args.out),
             input_names=['pillar_features', 'pillar_mask'],
             output_names=['pillar_embeddings'],
             dynamic_axes={
@@ -111,10 +140,10 @@ def main():
             do_constant_folding=True,
         )
 
-    print(f"导出完成：{out_path}")
+    print(f"导出完成：{args.out}")
 
     import onnx
-    m = onnx.load(out_path)
+    m = onnx.load(str(args.out))
     onnx.checker.check_model(m)
     print("ONNX 校验通过")
 
