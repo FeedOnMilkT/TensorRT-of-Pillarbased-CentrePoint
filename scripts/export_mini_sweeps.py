@@ -206,9 +206,15 @@ def main():
     list_path = Path(args.list_path) if args.list_path else out_dir / "files.txt"
     file_list: list[str] = []
 
+    skipped = 0
     for index, sample in enumerate(samples):
         np.random.seed(args.seed + index)
-        points = aggregate(nusc, sample, args.max_sweeps)
+        try:
+            points = aggregate(nusc, sample, args.max_sweeps)
+        except FileNotFoundError as err:
+            skipped += 1
+            logger.warning("skip sample %d: missing sweep file %s", index, err.filename)
+            continue
         if points.ndim != 2 or points.shape[1] != 5:
             raise RuntimeError(f"Expected Nx5 points for index {index}, got shape {points.shape}")
 
@@ -223,6 +229,8 @@ def main():
 
         if (index + 1) % 20 == 0 or index + 1 == len(samples):
             logger.info("exported %d/%d", index + 1, len(samples))
+    if skipped:
+        logger.warning("skipped %d samples due to missing sweep files", skipped)
 
     list_path.parent.mkdir(parents=True, exist_ok=True)
     list_path.write_text("\n".join(file_list) + "\n")

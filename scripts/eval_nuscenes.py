@@ -122,7 +122,15 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    nusc = NuScenes(version=args.version, dataroot=args.data_root, verbose=False)
+    # nuscenes-devkit 期望 <dataroot>/<version>/category.json。我们的解压布局可能是
+    # /data/sidney/datasets/nuscenes/v1.0-trainval/{samples,sweeps,v1.0-trainval/}，
+    # 所以如果传入的 dataroot 下找不到 <version>/category.json 但其子目录 <version>/
+    # 下能找到，就自动往下走一层。镜像 export_mini_sweeps.py 的同名修正。
+    data_root = Path(args.data_root)
+    if not (data_root / args.version / "category.json").exists() and \
+       (data_root / args.version / args.version / "category.json").exists():
+        data_root = data_root / args.version
+    nusc = NuScenes(version=args.version, dataroot=str(data_root), verbose=False)
     fname_to_token = build_filename_to_sample(nusc)
     split_tokens = set(get_split_sample_tokens(nusc, args.split))
     print(f"split '{args.split}' 含 {len(split_tokens)} 帧")
